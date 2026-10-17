@@ -101,7 +101,11 @@ class ExperimentManager:
             wandb.init(project=self.config.wandb.project, name=self.name, mode=self.config.wandb.mode, config=namespace_to_dict(self.config))
 
     def _get_model_manager(self):
+        protein_config = namespace_to_dict(self.config.protein)
+        
         return ProtenixModelManager(
+            ligands=protein_config.get("ligands") or [], 
+            covalent_bonds=protein_config.get("covalent_bonds") or [],
             sequences_dictionary=self.config.protein.sequences,
             pdb_id=self.config.protein.pdb_id,
             assembly_identifier=self.config.protein.assembly_identifier,

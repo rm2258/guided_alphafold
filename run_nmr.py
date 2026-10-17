@@ -2,6 +2,7 @@ import argparse
 import glob
 from pathlib import Path
 import os
+import json
 
 from experiment_manager import ExperimentManager
 from src.utils.io import load_config, write_multi_model_pdb
@@ -39,6 +40,36 @@ def relaxed_files_in_model_order(verbose_directory):
 
     return sorted(files, key=lambda p: (model_index(p), p))
 
+def read_infer_conf(filename):
+    """
+    Read custom inference configuration file
+    """
+    path = Path(filename).expanduser().resolve()
+    try:
+        with path.open() as handle:
+            jobs = json.load(handle)
+    except (OSError, ValueError) as error:
+        raise OSError(f"Cannot read inference configuration file: {path}")
+        
+    if not isinstance(jobs, list):
+        raise ValueError("Invalid configuration file must be a JSON list.")
+    
+    if any(not isinstance(job, dict) for job in jobs):
+        raise ValueError("Invalid configuration file each job must be a JSON object.")
+    
+    if any("name" not in job or "sequences" not in job for job in jobs):
+        raise ValueError("Invalid configuration file missing required definitions.")
+    
+    for job in jobs:
+        if any(not isinstance(entity, dict) for entity in job["sequences"]):
+            raise ValueError("Invalid configuration file each sequence entity definition must be a JSON object.")
+        if any(len(entity) != 1 for entity in job["sequences"]):
+            raise ValueError("Invalid configuration file each sequence entity must be defined individually.")
+        
+        bonds = job.get("covalent_bonds", [])
+        if not isinstance(bonds, list) or any(not isinstance(bond, dict) for bond in bonds):
+            raise ValueError("Invalid configuration file covalent bonds is a list of JSON objects.")
+    return jobs
 
 def main():
     parser = argparse.ArgumentParser(
@@ -112,6 +143,8 @@ def main():
             "sequence starts at 1); output PDBs are then written in that same numbering."
         ),
     )
+    parser.add_argument("--inference-conf-file", type=str, default=None, 
+                        help="Custom inference configuration JSON file")
     parser.add_argument('--input_directory', type=str, required=False, default="nmr_pipeline_inputs")
     parser.add_argument('--output_directory', type=str, required=False, default="nmr_pipeline_outputs")
     parser.add_argument('--model_weights_path', type=str, default=os.environ.get("AF3_MODEL_WEIGHTS"), help="Path to the downloaded AF3 model weights.")
@@ -213,6 +246,34 @@ def main():
 
     # Loading the config file and merging it with the arguments
     config = load_config(config_file_path)
+    # ligands and/or covalent bonds
+    if args.inference_conf_file:
+        try:
+            custom_user_config_inputs = read_infer_conf(args.inference_conf_file)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        for job in custom_user_config_inputs:
+            ligands = [entity["ligand"] for entity in job["sequences"] if "ligand" in entity]
+            # check ligands
+            for index, ligand in enumerate(ligands):
+                specification = ligand.get("ligand")
+                count = ligand.get("count", 1)
+                if not isinstance(specification, str) or not specification:
+                    parser.error(f"Ligand {index} is missing 'ligand' definition.")
+                if type(count) is not int or count < 1:
+                    parser.error(f"Ligand {index}'s 'count' must be at least 1.")
+                ligand["count"] = count
+                
+                if specification.startswith("FILE_"):
+                    path = Path(specification[5:]).expanduser().resolve()
+                    if not path.is_file():
+                        parser.error(f"Ligand {index}'s file not found at {path}")
+                    ligand["ligand"] = f"FILE_{path}"
+            
+            covalent_bonds = job.get("covalent_bonds", [])
+            
+            config.protein.ligands = ligands
+            config.protein.covalent_bonds = covalent_bonds
     # Update model weights path in config
     if args.model_weights_path is not None:
         model_weights_path = Path(args.model_weights_path).expanduser().resolve()
@@ -233,6 +294,12 @@ def main():
         deterministic_mode=args.deterministic_mode,
     )
     pipeline.run()
+    
+    if getattr(config.protein, "ligands", None):
+        print("Ligand-containing prediction complete. "
+              "Skipping postprocessing: metrics, hydrogenation, "
+              "relaxation, and relaxed-ensemble assembly.")
+        return
 
     # Metrics!
     identifier = config.protein.pdb_id

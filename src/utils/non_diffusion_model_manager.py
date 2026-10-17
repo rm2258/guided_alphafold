@@ -10,6 +10,8 @@ from .io import AMINO_ACID_ATOMS_ORDER, ATOM_NAME_TO_ELEMENT, create_atom_mask, 
 from ..protenix.data.utils import save_structure_cif
 from tqdm import tqdm
 import os 
+from copy import deepcopy
+import numpy as np
 from ..protenix.model.sample_confidence import logits_to_score
 import sys
 import gemmi
@@ -111,11 +113,15 @@ class ProtenixModelManager:
                 use_msa=True,
                 batch_size=1,
                 device="cuda" if torch.cuda.is_available() else "cpu",
+                ligands=None,
+                covalent_bonds=None,
                 ):
         self.pdb_id = pdb_id
         self.reference_pdb = reference_pdb
         self.should_align_to_chains = should_align_to_chains
         self.sequences_dictionary = sequences_dictionary
+        self.ligands = deepcopy(ligands) if ligands is not None else []
+        self.covalent_bonds = deepcopy(covalent_bonds) if covalent_bonds is not None else []
         self.assembly_identifier = assembly_identifier
         self.pdb_contains_missing_atoms = pdb_contains_missing_atoms
         self.full_sequences = [[dictionary["sequence"],]*dictionary["count"] for dictionary in sequences_dictionary]
@@ -213,35 +219,55 @@ class ProtenixModelManager:
         else:
             atom_mask = torch.ones(strucutres.shape[1], device=strucutres.device, dtype=torch.bool)[None]
 
-        # TODO: Fix advaith with residue range
-        _, aligned_structure, _, _ = self_aligned_rmsd( strucutres, self.reference_atom_locations, atom_mask & (~self.ROI_atom_mask.to(device=atom_mask.device)) )
+        alignment_mask = (
+            atom_mask
+            & self.resolved_pdb_to_full_mask.to(atom_mask.device)
+            & ~self.ROI_atom_mask.to(atom_mask.device)
+            )
+        if not alignment_mask.any():
+            raise ValueError("No reference atoms are available for alignment.")
+        
+        _, aligned_structure, _, _ = self_aligned_rmsd(strucutres, self.reference_atom_locations, alignment_mask,)
         return aligned_structure
 
     def _generate_msa_configuration(self):
-        return [
-            {
-                "sequences": [
-                    {
-                        sequence_dict["sequence_type"]: {
-                            "sequence": sequence_dict["sequence"],
-                            "count": sequence_dict["count"],
-                            **({
-                                "msa": {
-                                    "precomputed_msa_dir": f"{self.msa_save_dir}/msa/{i+1}",
-                                    "pairing_db": "uniref100"
-                                }
-                            } if sequence_dict["sequence_type"] == "proteinChain" else {}),
-                            "modifications": []
-                        }
+        entities = []
+        
+        for i, sequence_dict in enumerate(self.sequences_dictionary):
+            sequence_type = sequence_dict.get("sequence_type", "proteinChain")
+            polymer = {
+                "sequence": sequence_dict["sequence"], 
+                "count": sequence_dict["count"], 
+                "modifications": deepcopy(sequence_dict.get("modifications", [])),
+                }
+            if sequence_type == "proteinChain":
+                polymer["msa"] = {
+                    "precomputed_msa_dir": os.path.join(self.msa_save_dir, "msa", str(i + 1)), 
+                    "pairing_db": "uniref100",
                     }
-                    for i, sequence_dict in enumerate(self.sequences_dictionary) 
-                ],
-                "modelSeeds": [],
-                "assembly_id": "1" if getattr(self, "assembly_identifier", None) is None else self.assembly_identifier,
-                "name": self.pdb_id
-            }
             
-        ]
+            entities.append({sequence_type: polymer})
+        
+        # ligands
+        entities.extend(
+            {"ligand": deepcopy(ligand)} 
+            for ligand in self.ligands
+            )
+        
+        job = {
+            "sequences": entities, 
+            "modelSeeds": [], 
+            "assembly_id": (
+                "1" if self.assembly_identifier is None 
+                else self.assembly_identifier
+                ), 
+            "name": self.pdb_id
+            }
+        
+        if self.covalent_bonds:
+            job["covalent_bonds"] = deepcopy(self.covalent_bonds)
+
+        return [job]
 
     def _generate_configs(self, device=None):
         configs = {**configs_base, **{"data": data_configs}, **inference_configs}
@@ -303,12 +329,16 @@ class ProtenixModelManager:
         self.s_inputs_init = s_inputs
     
     def _load_cached_msa_embedding(self): # not configuration anymore, the prepared msa embeddings generated using msa configs etc...! 
+        if self.ligands or self.covalent_bonds:
+            return
         file_path = os.path.join(self.msa_full_embedding_cache_dir, f"msa.pt")
         if os.path.exists(file_path):
             self.msa = torch.load(file_path, weights_only=False)
             self.msa.to(self.device)
     
     def _save_cache_msa_embedding(self):
+        if self.ligands or self.covalent_bonds:
+            return
         file_path = os.path.join(self.msa_full_embedding_cache_dir, f"msa.pt")
         if not os.path.exists(file_path):
             os.makedirs(self.msa_full_embedding_cache_dir, exist_ok=True)
@@ -316,20 +346,72 @@ class ProtenixModelManager:
             torch.save(self.msa, file_path)
             self.msa.to(self.device)
 
+    def _expand_masks_to_model_topology(self):
+        """
+        Place existing polymer masks onto the complete model atom array.
+        """
+        device = self.device
+        n_atoms = len(self.atom_array)
+        
+        polymer_entity_ids = {str(i + 1) for i in range(len(self.sequences_dictionary))}
+        polymer_mask_np = np.isin(self.atom_array.label_entity_id, list(polymer_entity_ids),)
+        polymer_indices = torch.as_tensor(np.flatnonzero(polymer_mask_np), dtype=torch.long, device=device,)
+        n_polymer_atoms = len(polymer_indices)
+        
+        self.polymer_atom_mask = torch.as_tensor(polymer_mask_np, dtype=torch.bool, device=device)
+        self.ligand_atom_mask = ~self.polymer_atom_mask
+        
+        # ROI for polymers only
+        old_roi = self.ROI_atom_mask.to(device=device, dtype=torch.bool)
+        if old_roi.numel() != n_polymer_atoms:
+            raise ValueError(
+                f"Polymer ROI mask has {old_roi.numel()} atoms, but "
+                f"Protenix constructed {n_polymer_atoms} polymer atoms. "
+                "Check the sequence and polymer topology."
+                )
+            
+        self.ROI_atom_mask = torch.zeros(n_atoms, dtype=torch.bool, device=device)
+        self.ROI_atom_mask[polymer_indices] = old_roi
+        
+        if self.reference_atom_locations is None:
+            # No reference comparison: all generated atoms are available.
+            self.resolved_pdb_to_full_mask = torch.ones(n_atoms, dtype=torch.bool, device=device)
+            return
+        
+        old_resolved = self.resolved_pdb_to_full_mask.to(device=device, dtype=torch.bool)
+        if old_resolved.numel() != n_polymer_atoms:
+            raise ValueError(
+                "The reference mask does not match the model's polymer "
+                "atom count. Reference atom mapping must be checked."
+                )
+        
+        resolved = torch.zeros(n_atoms, dtype=torch.bool, device=device)
+        resolved[polymer_indices] = old_resolved
+        
+        reference = self.reference_atom_locations.to(device)
+        expanded_reference = reference.new_zeros(reference.shape[:-2] + (n_atoms, 3))
+        
+        if reference.shape[-2] == n_polymer_atoms:
+            expanded_reference[..., polymer_indices, :] = reference
+        elif reference.shape[-2] == int(old_resolved.sum().item()):
+            matched_indices = polymer_indices[old_resolved]
+            expanded_reference[..., matched_indices, :] = reference
+        else:
+            raise ValueError(
+                "Reference coordinates do not match either the complete "
+                "polymer topology or its resolved atoms."
+                )
+        
+        self.reference_atom_locations = expanded_reference
+        self.resolved_pdb_to_full_mask = resolved
+
     def _setup(self, device=None):
         configs = self._generate_configs(device)
         dataloader = get_inference_dataloader(configs=configs, msa_configuration=self._generate_msa_configuration())
         self.eval_data_dict, self.atom_array, error_msg = next(iter(dataloader))[0]
         if error_msg:
             raise RuntimeError(f"Inference data featurization failed, {error_msg}")
-        if self.reference_pdb is None and self.resolved_pdb_to_full_mask.shape[0] != self.atom_array.shape[0]:
-            # Sequence-derived mask sizing must agree with the dataloader topology, or
-            # every downstream mask is silently misaligned against the coordinates.
-            raise ValueError(
-                f"Sequence-derived atom count ({self.resolved_pdb_to_full_mask.shape[0]}) does not match "
-                f"the model topology ({self.atom_array.shape[0]}). Check that the supplied sequence "
-                f"matches the intended construct."
-            )
+        self._expand_masks_to_model_topology()
         self.runner = InferenceRunner(configs)
         device = self.runner.device
         self.protenix_model = self.runner.model
@@ -554,85 +636,102 @@ class ProtenixModelManager:
 
 def save_structure_full(structure, full_sequences, sequence_types, atom_array, write_file_name, bfactors=None, atom_mask=None, start_residue_from=1):
     
-    gemmi_structure = gemmi.Structure()
-    model = gemmi.Model("1") 
+    def as_numpy(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        return np.asanyarray(value)
     
-    chains = []
-    if atom_mask is None:
-        atom_mask = torch.ones(structure.shape[0], dtype=torch.bool)
+    coordinates = as_numpy(structure)
+    n_atoms = len(atom_array)
     
-
-    for i in range(len(full_sequences)):
-        chains.append(gemmi.Chain(chr(ord("A") + i))) # either just chain A, or chain A,B,C etc. depending on the aligomeric state..!s
-        # TODO: Add the name of the chains to have 1-1 correspondence between the pdb and the chains in the structure 
-
-    iter_index = 0
+    if coordinates.shape != (n_atoms, 3):
+        raise ValueError(
+            f"Expected coordinates shaped ({n_atoms}, 3), "
+            f"received {coordinates.shape}."
+            )
+    if not np.isfinite(coordinates).all():
+        raise ValueError("Predicted coordinates contain nonfinite values.")
+        
+    keep = np.ones(n_atoms, dtype=bool) if atom_mask is None else as_numpy(atom_mask).astype(bool)
+    if keep.shape != (n_atoms,):
+        raise ValueError("atom_mask must have one entry per model atom.")
     
-    structure = structure.cpu().detach().numpy()
-    for chain_i, (chain, sequence_type) in enumerate(zip(chains, sequence_types)): 
-        sequence = full_sequences[chain_i]
-        for i, res_name_one_letter in enumerate(sequence): # creating the residue
-            res = gemmi.Residue()
-            res.name =  gemmi.expand_one_letter(res_name_one_letter, SEQUENCE_TYPE_TO_RESIDUE_KIND[sequence_type]) 
-            # Written in the caller's numbering, so output matches the restraint file's
-            # convention rather than exposing the internal 1..n sequence indexing.
-            res.seqid = gemmi.SeqId(i + int(start_residue_from or 1), " ")
-            residue_has_atoms = False  # Track if this residue has any atoms
+    b_values = np.zeros(n_atoms) if bfactors is None else as_numpy(bfactors)
+    if b_values.shape != (n_atoms,):
+        raise ValueError("bfactors must have one entry per model atom.")
+    
+    if int(keep.sum()) > 99999:
+        raise ValueError("Too many atoms for this PDB writer; use mmCIF.")
+    
+    records = []
+    serial_by_index = {}
+    offset = len(start_residue_from or 1) - 1
+    
+    for index in np.flatnonzero(keep):
+        chain = str(atom_array.chain_id[index])
+        residue = str(atom_array.res_name[index])
+        name = str(atom_array.atom_name[index])
+        element = str(atom_array.element[index]).strip().upper()
+        hetero = bool(atom_array.hetero[index])
+        
+        # Apply restraint numbering to polymers, not ligand residues.
+        residue_number = int(atom_array.res_id[index])
+        if not hetero:
+            residue_number += offset
+        
+        if len(chain) != 1:
+            raise ValueError("PDB requires one-character chain IDs; use mmCIF.")
+        if len(residue) > 3 or len(name) > 4:
+            raise ValueError("Atom/residue name exceeds PDB field width.")
+        if not -999 <= residue_number <= 9999:
+            raise ValueError("Residue number exceeds PDB field width.")
+        
+        x, y, z = coordinates[index]
+        if any(len(f"{value:8.3f}") != 8 for value in (x, y, z)):
+            raise ValueError("Coordinate exceeds PDB field width.")
             
-            # Every first residue of a dna or rna chain should have the OP3 atom
-            if sequence_type in ["rnaSequence", "dnaSequence"] and i == 0:
-                if atom_mask[iter_index] == True:
-                    atom = gemmi.Atom()
-                    atom.name = "OP3"
-                    atom.element = gemmi.Element("O")
-                    atom.pos = gemmi.Position(*structure[iter_index])
-                    if bfactors is not None:
-                        atom.b_iso = bfactors[iter_index]
-                    res.add_atom(atom)
-                    residue_has_atoms = True
-                    iter_index += 1
-
+        serial = len(serial_by_index) + 1
+        serial_by_index[index] = serial
+        
+        # PDB atom-name alignment depends on the element/name.
+        if len(name) == 4 or len(element) == 2 or name[0].isdigit():
+            atom_field = f"{name:<4}"
+        else:
+            atom_field = f" {name:<3}"
+        
+        record_type = "HETATM" if hetero else "ATOM "
+        records.append(
+            f"{record_type}{serial:5d} {atom_field} "
+            f"{residue:>3} {chain}{residue_number:4d}    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}"
+            f"{1.0:6.2f}{float(b_values[index]):6.2f}"
+            f"          {element:>2}  \n"
+            )
+    
+    neighbors = {}
+    if atom_array.bonds is not None:
+        for atom_i, atom_j, _ in atom_array.bonds.as_array():
+            serial_i = serial_by_index.get(int(atom_i))
+            serial_j = serial_by_index.get(int(atom_j))
+            if serial_i is None or serial_j is None:
+                continue
             
-            for atom_name in SEQUENCE_TYPE_TO_ATOM_DICTIONARY[sequence_type][res.name]: # appending all the atoms in the residue    
-                if atom_mask[iter_index] == True:
-                    # Save this atom - it's resolved in the structure
-                    atom = gemmi.Atom()
-                    atom.name = atom_name
-                    atom.element = gemmi.Element(ATOM_NAME_TO_ELEMENT[atom_name])
-                    atom.pos = gemmi.Position(*structure[iter_index])
-                    if bfactors is not None:
-                        atom.b_iso = bfactors[iter_index]
-
-                    res.add_atom(atom)
-                    residue_has_atoms = True
-                
-                # Always increment iter_index to move through the concatenated mask
-                iter_index += 1
-            
-            # Handle OXT atom for the last residue of each chain
-            if i == len(sequence) - 1 and sequence_type == "proteinChain":  # Last residue in chain
-                if iter_index < len(atom_mask):
-                    if atom_mask[iter_index] == True:
-                        atom = gemmi.Atom()
-                        atom.name = "OXT"
-                        atom.element = gemmi.Element("O")
-                        atom.pos = gemmi.Position(*structure[iter_index])
-                        if bfactors is not None:
-                            atom.b_iso = bfactors[iter_index]
-
-                        res.add_atom(atom)
-                        residue_has_atoms = True
-                    
-                    # Always increment if we're within bounds (whether OXT exists or not)
-                    iter_index += 1
-
-            # Only add residue to chain if it has at least one atom
-            if residue_has_atoms:
-                chain.add_residue(res)
+            neighbors.setdefault(serial_i, set()).add(serial_j)
+            neighbors.setdefault(serial_j, set()).add(serial_i)
     
-        model.add_chain(chain)
+    for serial, bonded_serials in sorted(neighbors.items()):
+        bonded_serials = sorted(bonded_serials)
+        for start in range(0, len(bonded_serials), 4):
+            records.append(
+                f"CONECT{serial:5d}"
+                + "".join(
+                    f"{other:5d}" 
+                    for other in bonded_serials[start:start + 4]
+                    )
+                + '\n'
+                )
     
-    gemmi_structure.add_model(model)
-    
-    os.makedirs(os.path.dirname(write_file_name), exist_ok=True)
-    gemmi_structure.write_pdb(write_file_name)
+    records.append("END\n")
+    os.makedirs(os.path.dirname(write_file_name) or '.', exist_ok=True)
+    with open(write_file_name, "w") as handle:
+        handle.writelines(records)
