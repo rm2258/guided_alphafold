@@ -411,6 +411,29 @@ class ProtenixModelManager:
         self.eval_data_dict, self.atom_array, error_msg = next(iter(dataloader))[0]
         if error_msg:
             raise RuntimeError(f"Inference data featurization failed, {error_msg}")
+        
+        output_names = np.asarray(self.atom_array.res_name, dtype="U64").copy()
+        
+        for ligand_index, ligand in enumerate(self.ligands, start=1):
+            specification = ligand["ligand"]
+            
+            if not specification.startswith("FILE_") and specification[5:].lower().endswith(".sdf"):
+                continue
+            with open(specification[5:]) as handle:
+                title = handle.readline().strip()
+            # Use CCD title for residue names.
+            if not title:
+                raise ValueError("Missing SDF title, which is used as the ligands residue "
+                                 "name and is usually the CCD ID.")
+            if len(title) <= 3 and not any(character.isspace() for character in title):
+                output_name = title
+
+            entity_id = str(len(self.sequences_dictionary) + ligand_index)
+            entity_mask = self.atom_array.label_entity_id == entity_id
+            output_names[entity_mask] = output_name
+            
+        self.atom_array.set_annotation("output_res_name", output_names)
+        
         self._expand_masks_to_model_topology()
         self.runner = InferenceRunner(configs)
         device = self.runner.device
@@ -674,8 +697,13 @@ def save_structure_full(structure, full_sequences, sequence_types, atom_array, w
     offset = int(start_residue_from or 1) - 1
     
     for index in np.flatnonzero(keep):
-        chain_id = str(atom_array.chain_id[index])
-        res_name = str(atom_array.res_name[index])
+        chain_id = str(atom_array.label_asym_id[index])
+        
+        if "output_res_name" in atom_array.get_annotation_categories():
+            res_name = str(atom_array.output_res_name[index])
+        else:
+            res_name = str(atom_array.res_name[index])
+        
         atom_name = str(atom_array.atom_name[index])
         hetero = bool(atom_array.hetero[index])
         
@@ -723,32 +751,40 @@ def save_structure_full(structure, full_sequences, sequence_types, atom_array, w
     
     retained_bonds = []
     ligand_component_bonds = set()
-    
     if atom_array.bonds is not None:
         for index_1, index_2, _ in atom_array.bonds.as_array():
             index_1, index_2 = int(index_1), int(index_2)
             if index_1 not in serials or index_2 not in serials:
                 continue
-            
+            # every topology bond is added to PDB CONNECT record
             retained_bonds.append((index_1, index_2))
             
+            name_1 = str(atom_array.atom_name[index_1])
+            name_2 = str(atom_array.atom_name[index_2])
             # Record explicit inter-residue topology connections.
-            if residue_keys[index_1] != residue_keys[index_2]:
+            different_residues = residue_keys[index_1] != residue_keys[index_2]
+            is_disulfide = (different_residues
+                            and str(atom_array.res_name[index_1]) == "CYS"
+                            and str(atom_array.res_name[index_2]) == "CYS"
+                            and name_1 == "SG" and name_2 == "SG")
+            
+            if is_disulfide:
                 connection = gemmi.Connection()
-                connection.name = f"bond{len(result.connections) + 1}"
-                connection.type = gemmi.ConnectionType.Covale
+                connection.name = f"disulf{len(result.connections) + 1}"
+                connection.type = gemmi.ConnectionType.Disulf
                 connection.asu = gemmi.Asu.Same
                 connection.partner1 = addresses[index_1]
                 connection.partner2 = addresses[index_2]
                 connection.reported_distance = float(np.linalg.norm(xyz[index_1] - xyz[index_2]))
                 result.connections.append(connection)
-            elif bool(atom_array.hetero[index_1]):
+                
+            if not different_residues and bool(atom_array.hetero[index_1]):
                 name_1, name_2 = sorted((
                     str(atom_array.atom_name[index_1]),
                     str(atom_array.atom_name[index_2]),
                     ))
                 ligand_component_bonds.add((
-                    str(atom_array.res_name[index_1]),
+                    residue_keys[index_1][3],
                     name_1,
                     name_2,
                     ))
@@ -756,7 +792,7 @@ def save_structure_full(structure, full_sequences, sequence_types, atom_array, w
     os.makedirs(os.path.dirname(write_file_name) or '.', exist_ok=True)
     
     if extenstion == ".pdb":
-        if not hasattr(result, "add_connect"):
+        if not hasattr(result, "add_conect"):
             raise RuntimeError(
                 "This Gemmi version lacks explicit CONNECT writing. "
                 "Use mmCIF output or a Gemmi version with add_connect()."
