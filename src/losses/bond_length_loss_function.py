@@ -15,24 +15,30 @@ class BondLengthLossFunction(AbstractLossFunction):
         self._last_collision_loss = None
 
     def _initialize_topolgy_bonds(self):
-        # bonds and bond types, target_atom[i] = indexes of atoms bonded to atom i, padded with -1
-        target_atom, _ = connect_via_residue_names(self._atom_array_object).get_all_bonds()
-        bonds = set()
-        for i in range(target_atom.shape[0]):
-            bonded_atoms = target_atom[i]
-            for index in bonded_atoms:
-                if index != -1:
-                    bonds.add(tuple(sorted((i, index))))
+        topology = self._atom_array_object.bonds
+        
+        if topology is None:
+            raise ValueError(
+                "Bond-length loss requires the model's bond topology."
+                )
+        
+        bonds = topology.as_array()
+        
+        if len(bonds):
+            bonded_atoms = np.asarray(bonds[:, :2], dtype=np.int64)
+        else:
+            bonded_atoms = np.empty((0, 2), dtype=np.int64)
+        
         bond_lengths = []
-        bonded_atoms = np.array(list(bonds))
-        for atom_1_index, atom_2_index in bonded_atoms:
-            atom_1_element = gemmi.Element(self._atom_array_object[atom_1_index].element)
-            atom_2_element = gemmi.Element(self._atom_array_object[atom_2_index].element)
-            bond_length = atom_1_element.covalent_r + atom_2_element.covalent_r
-            bond_lengths.append(bond_length)
-        bonded_atoms = torch.tensor(bonded_atoms, device=self._device)
-        bond_lengths = torch.tensor(bond_lengths, device=self._device, dtype=torch.float32)
-        return bonded_atoms, bond_lengths
+        for index_1, index_2 in bonded_atoms:
+            element_1 = gemmi.Element(self._atom_array_object[index_1].element)
+            element_2 = gemmi.Element(self._atom_array_object[index_2].element)
+            bond_lengths.append(element_1.covalent_r + element_2.covalent_r)
+        
+        return (
+            torch.as_tensor(bonded_atoms, device=self._device, dtype=torch.long,), 
+            torch.as_tensor(bond_lengths, device=self._device, dtype=torch.float32,), 
+                )
     
     def _initialize_collision_distances(self):
         atom_covalent_r = np.array([gemmi.Element(self._atom_array_object[index].element).covalent_r for index in range(len(self._atom_array_object))])
@@ -49,8 +55,8 @@ class BondLengthLossFunction(AbstractLossFunction):
         mask = torch.zeros_like(distances)
         mask[:, self._bonds[...,0], self._bonds[...,1]] = 3
         mask[:, self._bonds[...,1], self._bonds[...,0]] = 3
-        mask[:, self._bonds[...,0], self._bonds[...,0]] = 3
-        mask[:, self._bonds[...,1], self._bonds[...,1]] = 3
+        diagonal = torch.arange(atom_locations.shape[1], device=atom_locations.device,)
+        mask[:, diagonal, diagonal] = 3
         distances = distances + mask
         threshold_loss = (self._collision_distances + padding - distances).max(dim=0)[0].relu()
         return threshold_loss.sum() / atom_locations.shape[0]

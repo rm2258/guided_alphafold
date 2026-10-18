@@ -634,104 +634,153 @@ class ProtenixModelManager:
         gemmi_structure.write_pdb(write_file_name)
 
 
-def save_structure_full(structure, full_sequences, sequence_types, atom_array, write_file_name, bfactors=None, atom_mask=None, start_residue_from=1):
+def save_structure_full(structure, full_sequences, sequence_types, atom_array, write_file_name, 
+                        bfactors=None, atom_mask=None, start_residue_from=1):
     
-    def as_numpy(value):
+    def to_numpy(value):
         if isinstance(value, torch.Tensor):
             return value.detach().cpu().numpy()
         return np.asanyarray(value)
     
-    coordinates = as_numpy(structure)
+    xyz = to_numpy(structure)
     n_atoms = len(atom_array)
     
-    if coordinates.shape != (n_atoms, 3):
+    if xyz.shape != (n_atoms, 3):
         raise ValueError(
-            f"Expected coordinates shaped ({n_atoms}, 3), "
-            f"received {coordinates.shape}."
+            f"Expected coordinates ({n_atoms}, 3), "
+            f"received {xyz.shape}."
             )
-    if not np.isfinite(coordinates).all():
-        raise ValueError("Predicted coordinates contain nonfinite values.")
+    if not np.isfinite(xyz).all():
+        raise ValueError("Predicted coordinates contain NaN or infinity.")
         
-    keep = np.ones(n_atoms, dtype=bool) if atom_mask is None else as_numpy(atom_mask).astype(bool)
-    if keep.shape != (n_atoms,):
-        raise ValueError("atom_mask must have one entry per model atom.")
+    keep = np.ones(n_atoms, dtype=bool) if atom_mask is None else to_numpy(atom_mask).astype(bool)
+    b_values = np.zeros(n_atoms) if bfactors is None else to_numpy(bfactors)
+    if keep.shape != (n_atoms,) or b_values.shape != (n_atoms,):
+        raise ValueError("Atom_mask/B-factors must match the model atom count.")
+
+    extenstion = os.path.splitext(write_file_name)[1].lower()
+    if extenstion not in (".pdb", ".cif", ".mmcif"):
+        raise ValueError("Output extension must be .pdb, .cif, or .mmcif.")
+        
+    result = gemmi.Structure()
+    result.name = "prediction"
+    model = gemmi.Model("1")
     
-    b_values = np.zeros(n_atoms) if bfactors is None else as_numpy(bfactors)
-    if b_values.shape != (n_atoms,):
-        raise ValueError("bfactors must have one entry per model atom.")
-    
-    if int(keep.sum()) > 99999:
-        raise ValueError("Too many atoms for this PDB writer; use mmCIF.")
-    
-    records = []
-    serial_by_index = {}
-    offset = len(start_residue_from or 1) - 1
+    chains = {}
+    residues = {}
+    addresses = {}
+    serials = {}
+    residue_keys = {}
+    offset = int(start_residue_from or 1) - 1
     
     for index in np.flatnonzero(keep):
-        chain = str(atom_array.chain_id[index])
-        residue = str(atom_array.res_name[index])
-        name = str(atom_array.atom_name[index])
-        element = str(atom_array.element[index]).strip().upper()
+        chain_id = str(atom_array.chain_id[index])
+        res_name = str(atom_array.res_name[index])
+        atom_name = str(atom_array.atom_name[index])
         hetero = bool(atom_array.hetero[index])
         
-        # Apply restraint numbering to polymers, not ligand residues.
-        residue_number = int(atom_array.res_id[index])
+        res_number = int(atom_array.res_id[index])
         if not hetero:
-            residue_number += offset
+            res_number += offset
         
-        if len(chain) != 1:
-            raise ValueError("PDB requires one-character chain IDs; use mmCIF.")
-        if len(residue) > 3 or len(name) > 4:
-            raise ValueError("Atom/residue name exceeds PDB field width.")
-        if not -999 <= residue_number <= 9999:
-            raise ValueError("Residue number exceeds PDB field width.")
-        
-        x, y, z = coordinates[index]
-        if any(len(f"{value:8.3f}") != 8 for value in (x, y, z)):
-            raise ValueError("Coordinate exceeds PDB field width.")
+        insertion_code = str(atom_array.ins_code[index]).strip() or " "
+        key = (chain_id, res_number, insertion_code, res_name, hetero)
+  
+        if chain_id not in chains:
+            chains[chain_id] = gemmi.Chain(chain_id)
             
-        serial = len(serial_by_index) + 1
-        serial_by_index[index] = serial
+        if key not in residues:
+            residue = gemmi.Residue()
+            residue.name = res_name
+            residue.seqid = gemmi.SeqId(res_number, insertion_code)
+            residue.het_flag = "H" if hetero else "A"
+            residue.entity_type = gemmi.EntityType.NonPolymer if hetero else gemmi.EntityType.Polymer
+            residues[key] = residue
+            
+        atom = gemmi.Atom()
+        atom.name = atom_name
+        atom.element = gemmi.Element(str(atom_array.element[index]))
+        atom.pos = gemmi.Position(*map(float, xyz[index]))
+        atom.occ = 1.0
+        atom.b_iso = float(b_values[index])
+        atom.serial = len(serials) + 1
         
-        # PDB atom-name alignment depends on the element/name.
-        if len(name) == 4 or len(element) == 2 or name[0].isdigit():
-            atom_field = f"{name:<4}"
-        else:
-            atom_field = f" {name:<3}"
-        
-        record_type = "HETATM" if hetero else "ATOM "
-        records.append(
-            f"{record_type}{serial:5d} {atom_field} "
-            f"{residue:>3} {chain}{residue_number:4d}    "
-            f"{x:8.3f}{y:8.3f}{z:8.3f}"
-            f"{1.0:6.2f}{float(b_values[index]):6.2f}"
-            f"          {element:>2}  \n"
-            )
+        residues[key].add_atom(atom)
+        serials[int(index)] = atom.serial
+        residue_keys[int(index)] = key
+        addresses[int(index)] = gemmi.AtomAddress(
+            chain_id, 
+            gemmi.SeqId(res_number, insertion_code),
+            res_name, atom_name,
+                                                  )
     
-    neighbors = {}
+    for key, residue in residues.items():
+        chains[key[0]].add_residue(residue)
+    for chain in chains.values():
+        model.add_chain(chain)
+    result.add_model(model)
+    result.setup_entities()
+    
+    retained_bonds = []
+    ligand_component_bonds = set()
+    
     if atom_array.bonds is not None:
-        for atom_i, atom_j, _ in atom_array.bonds.as_array():
-            serial_i = serial_by_index.get(int(atom_i))
-            serial_j = serial_by_index.get(int(atom_j))
-            if serial_i is None or serial_j is None:
+        for index_1, index_2, _ in atom_array.bonds.as_array():
+            index_1, index_2 = int(index_1), int(index_2)
+            if index_1 not in serials or index_2 not in serials:
                 continue
             
-            neighbors.setdefault(serial_i, set()).add(serial_j)
-            neighbors.setdefault(serial_j, set()).add(serial_i)
-    
-    for serial, bonded_serials in sorted(neighbors.items()):
-        bonded_serials = sorted(bonded_serials)
-        for start in range(0, len(bonded_serials), 4):
-            records.append(
-                f"CONECT{serial:5d}"
-                + "".join(
-                    f"{other:5d}" 
-                    for other in bonded_serials[start:start + 4]
-                    )
-                + '\n'
-                )
-    
-    records.append("END\n")
+            retained_bonds.append((index_1, index_2))
+            
+            # Record explicit inter-residue topology connections.
+            if residue_keys[index_1] != residue_keys[index_2]:
+                connection = gemmi.Connection()
+                connection.name = f"bond{len(result.connections) + 1}"
+                connection.type = gemmi.ConnectionType.Covale
+                connection.asu = gemmi.Asu.Same
+                connection.partner1 = addresses[index_1]
+                connection.partner2 = addresses[index_2]
+                connection.reported_distance = float(np.linalg.norm(xyz[index_1] - xyz[index_2]))
+                result.connections.append(connection)
+            elif bool(atom_array.hetero[index_1]):
+                name_1, name_2 = sorted((
+                    str(atom_array.atom_name[index_1]),
+                    str(atom_array.atom_name[index_2]),
+                    ))
+                ligand_component_bonds.add((
+                    str(atom_array.res_name[index_1]),
+                    name_1,
+                    name_2,
+                    ))
+                
     os.makedirs(os.path.dirname(write_file_name) or '.', exist_ok=True)
-    with open(write_file_name, "w") as handle:
-        handle.writelines(records)
+    
+    if extenstion == ".pdb":
+        if not hasattr(result, "add_connect"):
+            raise RuntimeError(
+                "This Gemmi version lacks explicit CONNECT writing. "
+                "Use mmCIF output or a Gemmi version with add_connect()."
+                               )
+        
+        for index_1, index_2 in retained_bonds:
+            result.add_conect(serials[index_1], serials[index_2], 1)
+            
+        options = gemmi.PdbWriteOptions()
+        options.preserve_serial = True
+        options.numbered_ter = False
+        options.conect_records = True
+        result.write_pdb(write_file_name, options)
+    else:
+        document = result.make_mmcif_document()
+        
+        if ligand_component_bonds:
+            loop = document.sole_block().init_loop(
+                "_chem_comp_bond.",
+                ["comp_id", "atom_id_1", "atom_id_2", "value_order"],
+                )
+            for res_name, name_1, name_2 in sorted(ligand_component_bonds):
+                # Connectivity is known; do not invent missing bond orders.
+                loop.add_row([res_name, name_1, name_2, "?"])
+        
+        document.write_file(write_file_name)
+

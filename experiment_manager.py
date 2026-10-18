@@ -22,6 +22,39 @@ from src.utils.run_receipts import (
     receipts_enabled,
 )
 from src.losses import * 
+from src.losses.abstract_loss_funciton import AbstractLossFunction
+
+class AtomSubsetLoss(AbstractLossFunction):
+    """
+    Evaluate an existing loss on selected atoms of the full prediction.
+    """
+    
+    def __init__(self, loss, atom_indices):
+        self.loss = loss
+        self.atom_indices = atom_indices
+        
+    def _select(self, coordinates):
+        if coordinates is None:
+            return None
+        indices = self.atom_indices.to(coordinates.device)
+        return coordinates.index_select(-2, indices)
+    
+    def __call__(self, x_0_hat, time, structures=None, i=None, step=None):
+        value, corrected_subset = self.loss(self._select(x_0_hat), time, 
+                                            structures=self._select(structures), 
+                                            i=i, step=step,)
+        if corrected_subset is None:
+            return value, None
+        
+        indices = self.atom_indices.to(x_0_hat.device)
+        corrected_full = x_0_hat.index_copy(-2, indices, corrected_subset)
+        return value, corrected_full
+    
+    def wandb_log(self, x_0_hat):
+        return self.loss.wandb_log(self._select(x_0_hat))
+    
+    def post_optimization_step(self):
+        return self.loss.post_optimization_step()
 
 class ExperimentManager:
     def __init__(
@@ -137,6 +170,21 @@ class ExperimentManager:
     def _get_loss_function(self):
         loss_functions = []
         weights = []
+        
+        protein_mask = (
+            self.model_manager.input_feature_dict["is_protein"]
+            .detach()
+            .bool()
+            )
+        
+        protein_indices = torch.nonzero(protein_mask, as_tuple=True)[0]
+        
+        if protein_indices.numel() == 0:
+            raise ValueError(
+                "The configured protein losses require protein atoms."
+                )
+            
+        protein_atom_array = self.model_manager.atom_array[protein_mask.cpu().numpy()]
 
         # Defining objects for the main loss functions!
         self.density_loss_function = None
@@ -167,7 +215,7 @@ class ExperimentManager:
                 noe_config = self.config.loss_function.nmr_loss_function
                 loss_function = NMRLossFunction(restraint_file=noe_config.reference_nmr,
                                                         pdb_file=noe_config.pdb_file,
-                                                        atom_array=self.model_manager.atom_array,
+                                                        atom_array=protein_atom_array,
                                                         device=self.device, 
                                                         methyl_relax_file=noe_config.methyl_relax_file,
                                                         methyl_relax_scale=noe_config.methyl_relax_scale,
@@ -181,6 +229,7 @@ class ExperimentManager:
                                                         # op_n_bootstrap=noe_config.op_n_bootstrap,
                                                         start_residue_from=getattr(self.config.protein, "start_residue_from", 1) or 1,
                                                         iid_loss=noe_config.iid_loss)
+                loss_function = AtomSubsetLoss(loss_function, protein_indices)
                 loss_functions.append(loss_function)
                 self.nmr_loss_function = loss_function
                 loss_weight = getattr(noe_config, "weight", 1)
@@ -263,7 +312,8 @@ class ExperimentManager:
                 raise ValueError(f"The loss function {loss_function_type} is not supported!")
 
         if self.config.loss_function.violation_loss_weight > 0:
-            loss_functions.append(ViolationLossFunction(self.model_manager.atom_array))
+            violation_loss = ViolationLossFunction(protein_atom_array)
+            loss_functions.append(AtomSubsetLoss(violation_loss, protein_indices))
             weights.append(self.config.loss_function.violation_loss_weight)
         cryoesp_cfg = getattr(self.config.loss_function, "cryoesp_loss_function", None)
         cryo_log_bond = (
