@@ -293,6 +293,8 @@ def main():
         run_receipts=args.run_receipts or args.deterministic_mode,
         deterministic_mode=args.deterministic_mode,
     )
+    print(f"Predicted samples: {config.general.batch_size}")
+    print(f"Guidance enabled: {config.general.apply_diffusion_guidance}")
     pipeline.run()
     
     if getattr(config.protein, "ligands", None):

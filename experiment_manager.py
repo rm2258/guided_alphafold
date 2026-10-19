@@ -43,6 +43,7 @@ class AtomSubsetLoss(AbstractLossFunction):
         value, corrected_subset = self.loss(self._select(x_0_hat), time, 
                                             structures=self._select(structures), 
                                             i=i, step=step,)
+        self.last_value = value
         if corrected_subset is None:
             return value, None
         
@@ -373,7 +374,7 @@ class ExperimentManager:
                     self.model_manager.full_sequences,
                     self.model_manager.sequence_types,
                     self.model_manager.atom_array,
-                    os.path.join(verbose_path, f"{name}_{i}.pdb"),
+                    os.path.join(verbose_path, f"{name}_{i:02}.pdb"),
                     bfactors=None,
                     start_residue_from=getattr(self.config.protein, "start_residue_from", 1) or 1,
                 )
@@ -439,7 +440,42 @@ class ExperimentManager:
                             stage_index=int(step),
                             meta={"diffusion_index": int(i)},
                         )
+                    audit = None
+                    audit_step = step == 0 or (step + 1) % 20 == 0
+                    
+                    if audit_step and self.nmr_loss_function is not None:
+                        nmr_value = self.nmr_loss_function.last_value
+                        
+                        if nmr_value.requires_grad:
+                            nmr_gradient = torch.autograd.grad(nmr_value, structures, retain_graph=True, allow_unused=True,)[0]
+                        else:
+                            nmr_gradient = None
+                            
+                        nmr_config = self.config.loss_function.nmr_loss_function
+                        
+                        audit = {
+                            "step": int(step + 1),
+                            "diffusion_index": int(i),
+                            "total_loss": float(loss_value.detach().item()),
+                            "nmr_loss": float(nmr_value.detach().item()),
+                            "nmr_weight": float(getattr(nmr_config, "weight", 1)),
+                            "noe_scale": float(nmr_config.noe_scale),
+                            "nmr_connected_to_sampling_coordinates": nmr_gradient is not None,
+                            "nmr_gradient_norm": float(nmr_gradient.detach().norm().item()) if nmr_gradient is not None else None,
+                            "nmr_gradient_finite": bool(torch.isfinite(nmr_gradient).all().item()) if nmr_gradient is not None else None,
+                                 }
                     loss_value.backward()
+                    if audit is not None:
+                        gradient = structures.grad
+                        audit["total_gradient_norm"] = float(gradient.detach().norm().item()) if gradient is not None else None
+                        audit["total_gradient_finite"] = bool(torch.isfinite(gradient).all().item()) if gradient is not None else None
+                        
+                        audit_path = os.path.join(self.experiment_save_dir, "guidance_audit.jsonl",)
+                        with open(audit_path, "a") as handle:
+                            handle.write(json.dumps(audit) + "\n")
+                            
+                        print("[guidance audit] " + json.dumps(audit))
+                        
                     if interactive_progress:
                         steps_generator.set_description(f"running diffusion process, loss: {loss_value.item():.5f}")
                     elif step == 0 or (step + 1) % 10 == 0 or (step + 1) == total_steps:
