@@ -768,10 +768,16 @@ def save_structure_full(structure, full_sequences, sequence_types, atom_array, w
                             and str(atom_array.res_name[index_2]) == "CYS"
                             and name_1 == "SG" and name_2 == "SG")
             
-            if is_disulfide:
+            has_ligand_atom = bool(atom_array.hetero[index_1]) or bool(atom_array.hetero[index_2])
+            
+            if different_residues and (is_disulfide or has_ligand_atom):
                 connection = gemmi.Connection()
-                connection.name = f"disulf{len(result.connections) + 1}"
-                connection.type = gemmi.ConnectionType.Disulf
+                connection.name = f"connection{len(result.connections) + 1}"
+                connection.type = (
+                    gemmi.ConnectionType.Disulf
+                    if is_disulfide
+                    else gemmi.ConnectionType.Covale
+                                   )
                 connection.asu = gemmi.Asu.Same
                 connection.partner1 = addresses[index_1]
                 connection.partner2 = addresses[index_2]

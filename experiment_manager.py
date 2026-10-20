@@ -526,6 +526,23 @@ class ExperimentManager:
             self.receipt_ledger.record_tensor("initial_latents", latents, stage_index=0)
 
         structures = self.run_full_diffusion_process(latents)
+        
+        if self.nmr_loss_function is not None:
+            # AtomSubsetloss wraps the protein-only NMR loss.
+            wrapped_nmr = self.nmr_loss_function
+            
+            rows, groups, summary = wrapped_nmr.loss.distance_restraint_report(wrapped_nmr._select(structures), tolerance_A=0.0,)
+            
+            report_directory = os.path.join(self.experiment_save_dir, "restraint_reports")
+            os.makedirs(report_directory, exist_ok=True)
+            
+            rows.to_csv(os.path.join(report_directory, "noe_rows.csv"), index=False,)
+            groups.to_csv(os.path.join(report_directory, "noe_groups.csv"), index=False,)
+            summary.to_csv(os.path.join(report_directory, "noe_summary.csv"), index=False,)
+            
+            print("Final NOE restraint report:")
+            print(summary.to_string(index=False))
+        
         sub_folder_name = "diffusion_process"
         # Full identifier, not pdb_id[:4]: a no-op for 4-character PDB IDs, but keeps a
         # user-supplied conformation identifier from being truncated (my_conf_A -> my_c).

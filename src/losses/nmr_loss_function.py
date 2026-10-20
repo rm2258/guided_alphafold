@@ -556,6 +556,143 @@ class NMRLossFunction(AbstractLossFunction):
             cache[i] = ChainCtx(x0=x0_c, atom_arr=arr_c, H=H_batch, Hnames=Hnames)
         return cache
 
+    @torch.no_grad()
+    def distance_restraint_report(self, x_0_hat, tolerance_A=0.0):
+        """
+        Report NOE rows and OR groups without changing guidance.
+        """
+        if self.n_chains != 1 or np.any(self.multi_chain_mask_np):
+            raise NotImplementedError("This report currently supports one protein chain "
+                                      "and within-chain NOE restraints.")
+            
+        if tolerance_A < 0:
+            raise ValueError("tolerance_A must be nonnegative.")
+            
+        coordinates = x_0_hat.to(self.device)
+        ctx = self._prepare_chain_cache(coordinates)[0]
+        hydrogen_index = self._make_hname_index(ctx.Hnames)
+        batch_size = coordinates.shape[0]
+        
+        evaluations = [f"member_{i}" for i in range(batch_size)] + ["ensemble_mean_distance"]
+        
+        records = []
+        
+        for row_index, row in self.nmr_data.iterrows():
+            params = self.hydrogen_guidance_params[row_index]
+            endpoint_1 = tuple(params[:3])
+            endpoint_2 = tuple(params[3:])
+            reason = ""
+            
+            try:
+                point_1 = self._get_atom_coord_any(endpoint_1, hydrogen_index, ctx.H, ctx.x0, ctx.atom_arr)
+                point_2 = self._get_atom_coord_any(endpoint_2, hydrogen_index, ctx.H, ctx.x0, ctx.atom_arr)
+                
+                if point_1 is None or point_2 is None:
+                    reason = "Endpoint could not be resolved."
+                    distances = None
+                else:
+                    distances = torch.linalg.vector_norm(point_1 - point_2, dim=-1).cpu().numpy()
+                    
+                    if not np.isfinite(distances).all():
+                        reason = "Nonfinite endpoint distance."
+                        distances = None
+            except (KeyError, IndexError, ValueError, TypeError) as error:
+                reason = f"{type(error).__name__}: {error}"
+                distances = None
+                
+            values = [np.nan] * (batch_size + 1) if distances is None else list(distances) + [float(distances.mean())]
+            
+            lower = float(self.lower_bound[row_index].item())
+            upper = float(self.upper_bound[row_index].item())
+            
+            for evaluation, distance in zip(evaluations, values):
+                evaluated = bool(np.isfinite(distance))
+                lower_violation = max(lower - float(distance), 0.0) if evaluated else np.nan
+                upper_violation = max(float(distance) - upper, 0.0) if evaluated else np.nan
+                
+                records.append({
+                    "evaluation": evaluation,
+                    "noe_row": int(row_index + 1),
+                    "constrain_id": row["constrain_id"],
+                    "member_id": row["member_id"],
+                    "endpoint1": (
+                        f"{int(endpoint_1[0]) + self.residue_offset}:"
+                        f"{endpoint_1[1]}:{endpoint_1[2]}"
+                                  ),
+                    "endpoint2": (
+                        f"{int(endpoint_2[0]) + self.residue_offset}:"
+                        f"{endpoint_2[1]}:{endpoint_2[2]}"
+                        ),
+                    "lower_bound_A": lower,
+                    "upper_bound_A": upper,
+                    "distance_A": float(distance),
+                    "lower_violation_A": lower_violation,
+                    "upper_violation_A": upper_violation,
+                    "violation_A": lower_violation + upper_violation,
+                    "evaluated": evaluated,
+                    "reason": reason,
+                    })
+        
+        rows = pd.DataFrame(records)
+        group_records = []
+        
+        for (evaluation, group_id), alternatives in rows.groupby(["evaluation", "constrain_id"], sort=False):
+            valid = alternatives[alternatives["evaluated"]]
+            record = {
+                "evaluation": evaluation,
+                "constrain_id": group_id,
+                "alternatives_total": len(alternatives),
+                "alternatives_evaluated": len(valid),
+                "evaluated": not valid.empty,
+                "selected_noe_row": None,
+                "distance_A": np.nan,
+                "lower_violation_A": np.nan,
+                "upper_violation_A": np.nan,
+                "violation_A": np.nan,
+                "violated": None,
+                }
+            
+            if not valid.empty:
+                # Same minimum combined violation and upper-bound
+                # tie-break convention as _compute_bound_losses().
+                best = valid.sort_values(["violation_A", "upper_violation_A", "noe_row"]).iloc[0]
+                
+                for key in ("distance_A", "lower_violation_A", "upper_violation_A", "violation_A",):
+                    record[key] = float(best[key])
+                
+                record["selected_noe_row"] = int(best["noe_row"])
+                record["violated"] = record["violation_A"] > tolerance_A
+            
+            group_records.append(record)
+            
+        groups = pd.DataFrame(group_records)
+        summaries = []
+        
+        for evaluation, entries in groups.groupby("evaluation", sort=False):
+            valid = entries[entries["evaluated"]]
+            violated = int((valid["violation_A"] > tolerance_A).sum())
+            
+            summaries.append({
+                "evaluation": evaluation,
+                "groups_total": len(entries),
+                "groups_evaluated": len(valid),
+                "groups_unresolved": len(entries) - len(valid),
+                "groups_partially_resolved": int((
+                    entries["evaluated"] 
+                    & (
+                        entries["alternatives_evaluated"] 
+                        < entries["alternatives_total"]
+                        )
+                    ).sum()),
+                "groups_violated": violated,
+                "fraction_violated_among_evaluated": violated / len(valid) if len(valid) else np.nan,
+                "mean_violation_A": valid["violation_A"].mean(),
+                "max_violation_A": valid["violation_A"].max(),
+                "tolerance_A": tolerance_A,
+                })
+        
+        return rows, groups, pd.DataFrame(summaries)
+
     # ------------------------------- logging api --------------------------- #
     def wandb_log(self, _x_0_hat: torch.Tensor) -> Dict[str, Any]:
         """Return a dict of last computed scalars; call after __call__."""
