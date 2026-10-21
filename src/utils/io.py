@@ -395,39 +395,42 @@ def load_pdb_atom_locations(pdb_file, device="cpu", single_model=True):
 
 def chain_segments_from_atom_array(atom_array):
     """
-    True per-chain [start, stop) atom boundaries, plus normalized chain labels.
-
-    Boundaries come from contiguous runs of atom_array.chain_id rather than from
-    dividing the atom count evenly, so chains of differing length (hetero-complexes)
-    are segmented correctly. An even split only happens to be right for homo-oligomers.
-
-    Labels are normalized to their first character because the two sources disagree:
-    the Protenix dataloader emits "A0"/"B1" while structures written by
-    save_structure_full() (and hence read back by the metrics) use "A"/"B". Restraint
-    files are expected to use the single-character form.
-
-    Returns (labels: np.ndarray[str], segments: List[Tuple[int, int]]).
+    Returns chain labels and contiguous [start, stop) atom ranges.
     """
-    chain_id = np.asarray(atom_array.chain_id)
-    n_total = len(chain_id)
-    if n_total == 0:
+    internal_ids = np.asarray(atom_array.chain_id).astype(str)
+    
+    if len(internal_ids) == 0:
         return np.array([], dtype=object), []
-
-    def normalize(value):
-        if isinstance(value, (list, tuple, np.ndarray)):
-            value = value[0]
-        text = str(value)
-        return text[0] if text else text
-
+    
+    # Protenix supplies the same label_asym_id used by our output writer.
+    # Structures read from PDB may only have chain_id.
+    if "label_asym_id" in atom_array.get_annotation_categories():
+        output_ids = np.asarray(atom_array.label_asym_id).astype(str)
+    else:
+        output_ids = internal_ids
+        
     labels, segments = [], []
     start = 0
-    for index in range(1, n_total + 1):
-        if index == n_total or chain_id[index] != chain_id[start]:
-            labels.append(normalize(chain_id[start]))
-            segments.append((start, index))
-            start = index
-
-    return np.array(labels, dtype=object), segments
+    
+    for stop in range(1, len(internal_ids) + 1):
+        if stop == len(internal_ids) or internal_ids[stop] != internal_ids[start]:
+            segment_labels = np.unique(output_ids[start:stop])
+            
+            if len(segment_labels) != 1:
+                raise ValueError("One internal chain has multiple label_asym_id values.")
+                
+            label = str(segment_labels[0])
+            if not label.strip() or label in {'.', '?'}:
+                raise ValueError("Encountered an undefined chain identifier.")
+                
+            labels.append(label)
+            segments.append((start, stop))
+            start = stop
+            
+    if len(set(labels)) != len(labels):
+        raise ValueError("Distinct model chains have duplicate output chain identifires.")
+    
+    return np.asarray(labels, dtype=object), segments
 
 
 def write_multi_model_pdb(pdb_files, out_path):

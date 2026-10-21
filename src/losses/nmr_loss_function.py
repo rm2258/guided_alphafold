@@ -561,31 +561,61 @@ class NMRLossFunction(AbstractLossFunction):
         """
         Report NOE rows and OR groups without changing guidance.
         """
-        if self.n_chains != 1 or np.any(self.multi_chain_mask_np):
-            raise NotImplementedError("This report currently supports one protein chain "
-                                      "and within-chain NOE restraints.")
-            
         if tolerance_A < 0:
             raise ValueError("tolerance_A must be nonnegative.")
             
         coordinates = x_0_hat.to(self.device)
-        ctx = self._prepare_chain_cache(coordinates)[0]
-        hydrogen_index = self._make_hname_index(ctx.Hnames)
+        chain_cache = self._prepare_chain_cache(coordinates)
         batch_size = coordinates.shape[0]
         
+        label_to_index = {str(label): index for index, label in enumerate(self.chain_ids)}
+        hydrogen_indices = {index: self._make_hname_index(ctx.Hnames) for index, ctx in chain_cache.items()}
+        
+        
+        # Each entry identifies one restraint row and its two model chains.
+        instances = []
+        
+        for row_index in range(len(self.nmr_data)):
+            if self.chain1_col is None:
+                # Preserve the existing guidance convention: without chain
+                # columns, apply each within-chain restraint to every protein copy.
+                for chain_index in range(self.n_chains):
+                    instances.append((row_index, chain_index, chain_index))
+            else:
+                chain_1 = str(self.chain1_col[row_index])
+                chain_2 = str(self.chain2_col[row_index])
+                
+                missing = {label for label in (chain_1, chain_2) if label not in label_to_index}
+                if missing:
+                    raise ValueError(f"Restraint row {row_index + 1} references unknown "
+                                     f"chain(s) {sorted(missing)}. Available chains: "
+                                     f"{list(label_to_index)}.")
+                    
+                instances.append((row_index, label_to_index[chain_1], label_to_index[chain_2],))
+                
+        if not instances:
+            raise ValueError("No NOE restraint instances are available to report.")
+                
         evaluations = [f"member_{i}" for i in range(batch_size)] + ["ensemble_mean_distance"]
         
         records = []
         
-        for row_index, row in self.nmr_data.iterrows():
+        for row_index, left_index, right_index in instances:
+            row = self.nmr_data.iloc[row_index]
+            left = chain_cache[left_index]
+            right = chain_cache[right_index]
+            chain_1 = str(self.chain_ids[left_index])
+            chain_2 = str(self.chain_ids[right_index])
             params = self.hydrogen_guidance_params[row_index]
             endpoint_1 = tuple(params[:3])
             endpoint_2 = tuple(params[3:])
             reason = ""
             
             try:
-                point_1 = self._get_atom_coord_any(endpoint_1, hydrogen_index, ctx.H, ctx.x0, ctx.atom_arr)
-                point_2 = self._get_atom_coord_any(endpoint_2, hydrogen_index, ctx.H, ctx.x0, ctx.atom_arr)
+                point_1 = self._get_atom_coord_any(endpoint_1, hydrogen_indices[left_index], 
+                                                   left.H, left.x0, left.atom_arr,)
+                point_2 = self._get_atom_coord_any(endpoint_2, hydrogen_indices[right_index], 
+                                                   right.H, right.x0, right.atom_arr,)
                 
                 if point_1 is None or point_2 is None:
                     reason = "Endpoint could not be resolved."
@@ -615,11 +645,15 @@ class NMRLossFunction(AbstractLossFunction):
                     "noe_row": int(row_index + 1),
                     "constrain_id": row["constrain_id"],
                     "member_id": row["member_id"],
+                    "chain1": chain_1,
                     "endpoint1": (
+                        f"{chain_1}:"
                         f"{int(endpoint_1[0]) + self.residue_offset}:"
                         f"{endpoint_1[1]}:{endpoint_1[2]}"
                                   ),
+                    "chain2": chain_2,
                     "endpoint2": (
+                        f"{chain_2}:"
                         f"{int(endpoint_2[0]) + self.residue_offset}:"
                         f"{endpoint_2[1]}:{endpoint_2[2]}"
                         ),
@@ -636,7 +670,7 @@ class NMRLossFunction(AbstractLossFunction):
         rows = pd.DataFrame(records)
         group_records = []
         
-        for (evaluation, group_id), alternatives in rows.groupby(["evaluation", "constrain_id"], sort=False):
+        for (evaluation, chain_1, chain_2, group_id), alternatives in rows.groupby(["evaluation", "chain1", "chain2", "constrain_id"], sort=False):
             valid = alternatives[alternatives["evaluated"]]
             record = {
                 "evaluation": evaluation,
@@ -645,6 +679,8 @@ class NMRLossFunction(AbstractLossFunction):
                 "alternatives_evaluated": len(valid),
                 "evaluated": not valid.empty,
                 "selected_noe_row": None,
+                "chain1": chain_1,
+                "chain2": chain_2,
                 "distance_A": np.nan,
                 "lower_violation_A": np.nan,
                 "upper_violation_A": np.nan,
