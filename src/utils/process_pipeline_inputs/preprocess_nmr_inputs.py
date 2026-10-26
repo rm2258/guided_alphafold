@@ -541,11 +541,14 @@ def check_restraint_residue_numbering(df, sequences, start_residue_from=1, sourc
 
 def validate_restraint_csv(df, source=""):
     """
+    Validate NOE/PRE rows while preserving other restraint types.
     Fail early and by name on a malformed restraint table.
 
     Without this, a missing or non-numeric column surfaces much later as an opaque
     torch.tensor dtype error from deep inside the loss constructor.
     """
+    import math
+    
     where = f" in {source}" if source else ""
 
     missing = [c for c in REQUIRED_RESTRAINT_COLUMNS if c not in df.columns]
@@ -555,37 +558,68 @@ def validate_restraint_csv(df, source=""):
             f"Required columns are: {', '.join(REQUIRED_RESTRAINT_COLUMNS)}. "
             f"See the 'Restraint file format' table in the README."
         )
+        
+    has_chain1 = "chain1" in df.columns
+    has_chain2 = "chain2" in df.columns
 
-    if ("chain1" in df.columns) != ("chain2" in df.columns):
+    if has_chain1 != has_chain2:
         raise ValueError(
             f"Restraint file{where} has only one of 'chain1'/'chain2'. Supply both "
             f"(for inter-chain restraints) or neither (all restraints within-chain)."
         )
+        
+    active = df[df["type"].isin(["NOE", "PRE"])]
 
-    noe = df[df["type"] == "NOE"]
-    if noe.shape[0] == 0:
-        raise ValueError(
-            f"Restraint file{where} contains no rows with type == 'NOE'. "
-            f"Only NOE rows are used for guidance; found types: "
-            f"{sorted(set(df['type'].astype(str)))}."
-        )
-
-    # constrain_id groups OR-alternatives and is cast to a numeric tensor downstream.
-    if pd.to_numeric(noe["constrain_id"], errors="coerce").isna().any():
-        raise ValueError(
-            f"Restraint file{where} has non-numeric values in 'constrain_id'. "
-            f"It must be an integer OR-group id."
-        )
-
-    # upper_bound has no "." handling downstream, unlike lower_bound.
-    if pd.to_numeric(noe["upper_bound"], errors="coerce").isna().any():
-        raise ValueError(
-            f"Restraint file{where} has non-numeric values in 'upper_bound' "
-            f"(note: '.' is accepted in 'lower_bound' but NOT in 'upper_bound'). "
-            f"Every NOE row needs a numeric upper bound."
-        )
-
-    return noe.shape[0]
+    if active.empty:
+        raise ValueError(f"Restraint file{where} contains no NOE or PRE rows.")
+        
+    if (active["type"] == "PRE").any() and not has_chain1:
+        raise ValueError("PRE rows require chain1 and chain2 columns.")
+        
+    if has_chain1:
+        for column in ("chain1", "chain2"):
+            labels = active[column].astype("string").str.strip()
+            invalid = labels.isna() | labels.isin(['', '.', '?'])
+            
+            if invalid.any():
+                raise ValueError(f"Every NOE/PRE row must specify {column} "
+                                 "when chain columns exist.")
+            
+            if (labels != active[column].astype("string")).any():
+                raise ValueError(f"Remove surrounding whitespace from {column}.")
+                
+    for column in ("residue1_id", "residue2_id", "atom1", "atom2"):
+        values = active[column].astype("string").str.strip()
+        
+        if (values.isna() | values.isin(['', '.', '?'])).any():
+            raise ValueError(f"NOE/PRE rows have missing values in {column}.")
+            
+    numeric = {}
+    
+    for column in ("constrain_id", "residue1_num", "residue2_num", "lower_bound", "upper_bound"):
+        values = active[column]
+        
+        if column == "lower_bound":
+            values = values.replace('.', 0)
+            
+        values = pd.to_numeric(values, errors="coerce")
+        
+        if values.isna().any() or not values.map(math.isfinite).all():
+            raise ValueError("NOE/PRE rows need finite numeric values "
+                             f"in {column}.")
+        
+        numeric[column] = values
+        
+    for column in ("constrain_id", "residue1_num", "residue2_num"):
+        if (numeric[column] % 1 != 0).any():
+            raise ValueError(f"NOE/PRE values in {column} must be intergers.")
+    
+    invalid_bounds = (numeric["lower_bound"] < 0) | (numeric["upper_bound"] < numeric["lower_bound"])
+    if invalid_bounds.any():
+        raise ValueError("NOE/PRE bounds must satisfy "
+                         "0 <= lower_bound <= upper_bound.")
+        
+    return int((active["type"] == "NOE").sum())
 
 
 def prepare_custom_restraints(

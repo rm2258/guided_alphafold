@@ -23,6 +23,7 @@ from src.utils.run_receipts import (
 )
 from src.losses import * 
 from src.losses.abstract_loss_funciton import AbstractLossFunction
+from src.losses.pre_loss_function import PRELossFunction, NMRWithPRELoss
 
 class AtomSubsetLoss(AbstractLossFunction):
     """
@@ -230,7 +231,17 @@ class ExperimentManager:
                                                         # op_n_bootstrap=noe_config.op_n_bootstrap,
                                                         start_residue_from=getattr(self.config.protein, "start_residue_from", 1) or 1,
                                                         iid_loss=noe_config.iid_loss)
-                loss_function = AtomSubsetLoss(loss_function, protein_indices)
+                protein_loss = AtomSubsetLoss(loss_function, protein_indices)
+                
+                pre_loss = PRELossFunction(restraint_file=noe_config.reference_nmr, 
+                                           atom_array=self.model_manager.atom_array, 
+                                           protein_indices=protein_indices, 
+                                           protein_nmr=loss_function, 
+                                           scale=getattr(noe_config, "pre_scale", 1.0), 
+                                           ensemble_mode=getattr(noe_config, "pre_ensemble_mode", "mean"),)
+                
+                loss_function = NMRWithPRELoss(protein_loss, pre_loss)
+                
                 loss_functions.append(loss_function)
                 self.nmr_loss_function = loss_function
                 loss_weight = getattr(noe_config, "weight", 1)
@@ -464,6 +475,25 @@ class ExperimentManager:
                             "nmr_gradient_norm": float(nmr_gradient.detach().norm().item()) if nmr_gradient is not None else None,
                             "nmr_gradient_finite": bool(torch.isfinite(nmr_gradient).all().item()) if nmr_gradient is not None else None,
                                  }
+                        pre_loss = self.nmr_loss_function.pre_loss
+                        
+                        if pre_loss.has_restraints:
+                            pre_value = pre_loss.last_value
+                            
+                            pre_gradient = (
+                                torch.autograd.grad(pre_value, structures, retain_graph=True, 
+                                                    allow_unused=True,)[0] 
+                                if pre_value.requires_grad else None
+                                )
+                            
+                            audit.update({
+                                "pre_loss": float(pre_value.detach().item()),
+                                "pre_scale": pre_loss.scale,
+                                "pre_ensemble_mode": pre_loss.ensemble_mode,
+                                "pre_connected_to_sampling_coordinates": pre_gradient is not None,
+                                "pre_gradient_norm": float(pre_gradient.detach().norm().item()) if pre_gradient is not None else None,
+                                "pre_gradient_finite": bool(torch.isfinite(pre_gradient).all().item()) if pre_gradient is not None else None,
+                                })
                     loss_value.backward()
                     if audit is not None:
                         gradient = structures.grad
@@ -528,20 +558,18 @@ class ExperimentManager:
         structures = self.run_full_diffusion_process(latents)
         
         if self.nmr_loss_function is not None:
-            # AtomSubsetloss wraps the protein-only NMR loss.
-            wrapped_nmr = self.nmr_loss_function
-            
-            rows, groups, summary = wrapped_nmr.loss.distance_restraint_report(wrapped_nmr._select(structures), tolerance_A=0.0,)
-            
+            reports = self.nmr_loss_function.distance_restraint_reports(structures, tolerance_A=0.0)
             report_directory = os.path.join(self.experiment_save_dir, "restraint_reports")
             os.makedirs(report_directory, exist_ok=True)
             
-            rows.to_csv(os.path.join(report_directory, "noe_rows.csv"), index=False,)
-            groups.to_csv(os.path.join(report_directory, "noe_groups.csv"), index=False,)
-            summary.to_csv(os.path.join(report_directory, "noe_summary.csv"), index=False,)
-            
-            print("Final NOE restraint report:")
-            print(summary.to_string(index=False))
+            for restraint_type, report in reports.items():
+                rows, groups, summary = report
+                
+                rows.to_csv(os.path.join(report_directory, f"{restraint_type}_rows.csv"), index=False,)
+                groups.to_csv(os.path.join(report_directory, f"{restraint_type}_groups.csv"), index=False,)
+                summary.to_csv(os.path.join(report_directory, f"{restraint_type}_summary.csv"), index=False,)
+                print(f"Final {restraint_type.upper()} restraint report:")
+                print(summary.to_string(index=False))
         
         sub_folder_name = "diffusion_process"
         # Full identifier, not pdb_id[:4]: a no-op for 4-character PDB IDs, but keeps a

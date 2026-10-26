@@ -13,7 +13,7 @@ class PRELossFunction(AbstractLossFunction):
             protein_indices,
             protein_nmr,
             scale=1.0,
-            ensemble_mode="r6",):
+            ensemble_mode="mean",):
         self.atom_array = atom_array
         self.protein_nmr = protein_nmr
         self.protein_indices = protein_indices

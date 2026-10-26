@@ -531,8 +531,8 @@ class NMRLossFunction(AbstractLossFunction):
                             # add to total loss
             total_loss = total_loss + noe_multi
 
-        self.constraints_satisfied_ub = 1 - ub_or_total / self.num_constraints
-        self.constraints_satisfied_lb = 1 - lb_or_total / self.num_constraints
+        self.constraints_satisfied_ub = 1 - ub_or_total / self.num_constraints if self.num_constraints else None
+        self.constraints_satisfied_lb = 1 - lb_or_total / self.num_constraints if self.num_constraints else None
 
         # finalize scalars for logging
         self.noe_loss_within_chain_val = float(noe_within.item())
