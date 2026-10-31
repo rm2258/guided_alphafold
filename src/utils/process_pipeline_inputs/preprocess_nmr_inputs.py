@@ -659,7 +659,21 @@ def prepare_custom_restraints(
             f".str/.mr NMR-STAR file. Convert other formats (CYANA .upl and similar) to "
             f"the CSV schema first."
         )
-
+    
+    # An unspecified chain2 means same chain as the first
+    if "chain1" in df.columns and "chain2" in df.columns:
+        first = df["chain1"].astype("string").str.strip()
+        second = df["chain2"].astype("string").str.strip()
+        
+        missing_markers = ["", ".", "?", "none", "null"]
+        
+        has_first = first.notna() & ~first.str.lower().isin(missing_markers)
+        missing_second = second.isna() | second.str.lower().isin(missing_markers)
+        
+        within_chain = df["type"].isin(["NOE", "PRE"]) & has_first & missing_second
+        
+        df.loc[within_chain, "chain2"] = first[within_chain]
+    
     n_noe = validate_restraint_csv(df, source=restraints_path)
     if sequences and n_noe:
         check_restraint_residue_numbering(
@@ -737,7 +751,7 @@ def create_nmr_configuration_file_from_custom_inputs(
     amide_rdc_file=None,
     amide_relax_file=None,
     methyl_relax_file=None,
-    baseline_config_file_path="pipeline_configurations/nmr_baseline.yaml",
+    baseline_config_file_path=DEFAULT_NMR_BASELINE_CONFIG,
 ):
     """
     Build a guidance config from a sequence + restraints, with no deposited entry.
