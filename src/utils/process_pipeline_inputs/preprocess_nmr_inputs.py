@@ -661,13 +661,15 @@ def prepare_custom_restraints(
         )
 
     n_noe = validate_restraint_csv(df, source=restraints_path)
-    if sequences:
+    if sequences and n_noe:
         check_restraint_residue_numbering(
             df[df["type"] == "NOE"], sequences,
             start_residue_from=start_residue_from, source=restraints_path,
         )
     df.to_csv(csv_path, index=False)
-    print(f"Prepared {n_noe} NOE restraints for '{conformation_id}' -> {csv_path}")
+    
+    n_pre = int((df["type"] == "PRE").sum())
+    print(f"Prepared {n_noe} NOE and {n_pre} PRE restraints for '{conformation_id}' -> {csv_path}")
     return csv_path
 
 
