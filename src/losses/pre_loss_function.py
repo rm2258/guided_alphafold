@@ -115,7 +115,7 @@ class PRELossFunction(AbstractLossFunction):
         residue = indices[
             (arr.res_id[indices] == resnum) 
             & (
-                (arr.res_num[indices] == resname) 
+                (arr.res_name[indices] == resname) 
                 | (self.aliases[indices] == resname)
                 )
             ]
