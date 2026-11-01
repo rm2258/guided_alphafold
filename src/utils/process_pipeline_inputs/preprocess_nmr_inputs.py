@@ -621,10 +621,105 @@ def validate_restraint_csv(df, source=""):
         
     return int((active["type"] == "NOE").sum())
 
+def expand_chain_selections(df):
+    """
+    Expand chain lists into independent within-chain restraint rows.
+    """
+    if "chain1" not in df.columns and "chain2" not in df.columns:
+        return df
+    
+    if "chain1" not in df.columns or "chain2" not in df.columns:
+        raise ValueError("Supply both chain1 and chain2 columns.")
+        
+    def parse(value):
+        if isinstance(value, (list, tuple)):
+            entries = list(value)
+        else:
+            if pd.isna(value):
+                return []
+            
+            text = str(value).strip()
+            if text.lower() in {"", ".", "?", "none", "null"}:
+                return []
+            
+            if text.startswith("["):
+                if not text.endswith("]"):
+                    raise ValueError(f"Unclosed chain list: {text}")
+                
+                text = text[1:-1]
+            
+            entries = [item.strip("\"'") for item in text.replace(",", " ").split()]
+            
+        labels = []
+        for entry in entries:
+            if not isinstance(entry, str):
+                raise ValueError("Chain identifiers must be strings.")
+                
+            label = entry.strip()
+            if label.lower() in {"", ".", "?", "none", "null"} or any(character.isspace() or character in ",[]\"'" for character in label):
+                raise ValueError(f"Invalid chain identifier: {entry!r}")
+            
+            labels.append(label)
+            
+        if not labels or len(set(labels)) != len(labels):
+            raise ValueError("Chain lists must be nonempty and contain no duplicates.")
+        
+        return labels
+    
+    expanded = []
+    for row_number, (_, row) in enumerate(df.iterrows(), start=2):
+        if row["type"] not in {"NOE", "PRE"}:
+            expanded.append(row.to_dict())
+            continue
+        
+        try:
+            first = parse(row["chain1"])
+            second = parse(row["chain2"])
+            
+            if not first:
+                raise ValueError("chain1 is required.")
+                
+            if not second:
+                second = first
+            
+            if len(first) != len(second):
+                raise ValueError("chain1 and chain2 must contain the same number of IDs, "
+                                 "or chain2 must be blank for within-chain restraints.")
+            
+            pairs = list(zip(first, second))
+        except ValueError as error:
+            raise ValueError(f"Restraint CSV row {row_number}: {error}") from error
+            
+        for chain1, chain2 in pairs:
+            copy = row.to_dict()
+            copy.update(chain1=chain1, chain2=chain2)
+            expanded.append(copy)
+            
+    result = pd.DataFrame(expanded, columns=df.columns)
+    
+    # PRE groups must have separate IDs for different chain pairs.
+    # Preserve the original IDs for tracing the prepared rows.
+    pre_mask = result["type"].eq("PRE")
+    
+    if pre_mask.any():
+        if "source_constrain_id" not in result.columns:
+            result["source_constrain_id"] = result["constrain_id"]
+            
+        pre = result.loc[pre_mask]
+        ids = pd.to_numeric(pre["constrain_id"], errors="raise")
+        
+        if ids.isna().any() or (ids % 1 != 0).any():
+            raise ValueError("PRE constrain_id values must be integers.")
+            
+        keys = pd.Series(list(zip(ids, pre["chain1"], pre["chain2"])))
+        
+        result.loc[pre_mask, "constrain_id"] = pd.factorize(keys, sort=False)[0] + 1
+        
+    return result
 
-def prepare_custom_restraints(
-    restraints_path, conformation_id, input_directory, sequences=None, start_residue_from=1
-):
+
+def prepare_custom_restraints(restraints_path, conformation_id, input_directory, 
+                              sequences=None, start_residue_from=1):
     """
     Normalize a user-supplied restraint file into the CSV the pipeline consumes.
 
@@ -660,20 +755,7 @@ def prepare_custom_restraints(
             f"the CSV schema first."
         )
     
-    # An unspecified chain2 means same chain as the first
-    if "chain1" in df.columns and "chain2" in df.columns:
-        first = df["chain1"].astype("string").str.strip()
-        second = df["chain2"].astype("string").str.strip()
-        
-        missing_markers = ["", ".", "?", "none", "null"]
-        
-        has_first = first.notna() & ~first.str.lower().isin(missing_markers)
-        missing_second = second.isna() | second.str.lower().isin(missing_markers)
-        
-        within_chain = df["type"].isin(["NOE", "PRE"]) & has_first & missing_second
-        
-        df.loc[within_chain, "chain2"] = first[within_chain]
-    
+    df = expand_chain_selections(df)
     n_noe = validate_restraint_csv(df, source=restraints_path)
     if sequences and n_noe:
         check_restraint_residue_numbering(
@@ -850,7 +932,7 @@ def main_from_custom_inputs(
     methyl_relax_file=None,
 ):
     """Custom-input entry point: conformation id + sequence + restraint file."""
-    baseline_config_file_path = "pipeline_configurations/nmr_baseline.yaml"
+    baseline_config_file_path = DEFAULT_NMR_BASELINE_CONFIG
 
     sequence_list = [sequence] if isinstance(sequence, str) else list(sequence)
     restraints_csv_path = prepare_custom_restraints(
