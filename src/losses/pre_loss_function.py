@@ -142,6 +142,9 @@ class PRELossFunction(AbstractLossFunction):
                          "is absent; ligand hydrogen generation is not implemented.")
         
     def _distances(self, coordinates):
+        if not torch.isfinite(coordinates).all():
+            raise ValueError("Nonfinite model coordinates before PRE hydrogen generation.")
+            
         cache = None
         hydrogen_indicies = {}
         points = {}
@@ -174,6 +177,8 @@ class PRELossFunction(AbstractLossFunction):
                 hydrogen_index = hydrogen_indicies[chain_index][name]
                 value = cache[chain_index].H[:, hydrogen_index, :]
             
+            if not torch.isfinite(value).all():
+                raise ValueError(f"Nonfinite PRE endpoint coordinates: {endpoint!r}")
             points[endpoint] = value
             return value
         

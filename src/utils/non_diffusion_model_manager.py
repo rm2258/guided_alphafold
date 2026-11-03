@@ -425,12 +425,10 @@ class ProtenixModelManager:
             if not title:
                 raise ValueError("Missing SDF title, which is used as the ligands residue "
                                  "name and is usually the CCD ID.")
-            if len(title) <= 3 and not any(character.isspace() for character in title):
-                output_name = title
-
+            
             entity_id = str(len(self.sequences_dictionary) + ligand_index)
             entity_mask = self.atom_array.label_entity_id == entity_id
-            output_names[entity_mask] = output_name
+            output_names[entity_mask] = title
             
         self.atom_array.set_annotation("output_res_name", output_names)
         

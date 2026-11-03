@@ -242,97 +242,105 @@ class FragmentLibrary:
 
         return tar_frag_hydrogen_coord
     
-    def calculate_hydrogen_coord_batch(self, coords, bonds, names, elements, res_name, device, test=False):
-        assert coords.shape[1] == len(names)
-        atoms_num = coords.shape[1]
-        # The target and reference heavy atom coordinates
-        # for each fragment
-        tar_frag_center_coord = torch.zeros((coords.shape[0], atoms_num, 3), dtype=torch.float32, device=device)
-        tar_frag_heavy_coord = torch.zeros((coords.shape[0], atoms_num, 3, 3), dtype=torch.float32, device=device)
-        ref_frag_heavy_coord = torch.zeros((coords.shape[0], atoms_num, 3, 3), dtype=torch.float32, device=device)
-        # The amount of hydrogens varies for each fragment
-        # -> padding with NaN
-        # The maximum number of bond hydrogen atoms is 4
-        ref_frag_hydrogen_coord = torch.full(
-            (coords.shape[0], atoms_num, 4, 3), 0, dtype=torch.float32, device=device
-        )
-
-        # Fill the coordinate arrays
-        fragments = _fragment_batch(coords, bonds, names, elements, res_name, device)
-        for i, fragment in enumerate(fragments):
-            if fragment is None:
-                # This atom is not in mask
-                continue
-            (
-                central_element,
-                # central_charge,
-                stereo,
-                bond_types,
-                center_coord,
-                heavy_coord,
-                _,
-            ) = fragment
+    def calculate_hydrogen_coord_batch(self, coords, bonds, names, 
+                                       elements, res_name, device, 
+                                       test=False):
+        if coords.ndim != 3 or coords.shape[1:] != (len(names), 3):
+            raise ValueError("Expected coordinates shaped (batch, atoms, 3).")
+        
+        coords = coords.to(device=device, dtype=torch.float32)
+        
+        if not torch.isfinite(coords).all():
+            raise ValueError("Nonfinite heavy-atom coordinates before "
+                             "hydrogen generation.")
             
-            temp = torch.zeros_like(tar_frag_center_coord)
-            temp[:, i] = center_coord
-            tar_frag_center_coord = tar_frag_center_coord + temp
-            temp = torch.zeros_like(tar_frag_heavy_coord)
-            temp[:, i] = heavy_coord
-            tar_frag_heavy_coord = tar_frag_heavy_coord + temp
-            # The hydrogen_coord can be ignored:
-            # In the target structure are no hydrogen atoms
-            hit = [self._frag_dict.get((central_element, 0, int(val), tuple(bond_types))) for val in stereo] 
-            if None in hit:
-                warnings.warn(
-                    f"Missing fragment for atom '{names[i]}' "
-                    f"at position {i}"
-                )
-            else:
-                ref_heavy_coord = torch.from_numpy(np.stack([h[2] for h in hit])).to(device)
-                ref_hydrogen_coord = torch.from_numpy(np.stack([h[3] for h in hit]))
-                # if ref_hydrogen_coord.shape == torch.Size([6, 0]):
-                #     ref_hydrogen_coord = ref_hydrogen_coord.reshape(6, 0, 3)
-                temp = torch.zeros_like(ref_frag_heavy_coord)
-                temp[:, i] = ref_heavy_coord
-                ref_frag_heavy_coord = ref_frag_heavy_coord + temp
-                temp = torch.full(
-                    (coords.shape[0], atoms_num, 4, 3), 0, dtype=torch.float32, device=device
-                )
-                temp[:, i, : ref_hydrogen_coord.shape[1]]= (ref_hydrogen_coord)
-                mask = torch.zeros_like(ref_frag_hydrogen_coord)
-                mask[:, i, : ref_hydrogen_coord.shape[1]] = 1
-                ref_frag_hydrogen_coord = torch.where(mask.to(torch.bool), temp, ref_frag_hydrogen_coord)
+        batch_size, atom_count = coords.shape[:2]
+        
+        fragments = _fragment_batch(coords, bonds, names, elements, res_name, device)
+        
+        active_atoms = []
+        counts = []
+        centers = []
+        targets = []
+        references = []
+        hydrogen_references = []
+        
+        for index, fragment in enumerate(fragments):
+            if fragment is None:
+                continue
+            
+            element, stereo, bond_types, center, heavy, _ = fragment
+            
+            hits = [self._frag_dict.get((element, 0, int(value), tuple(bond_types))) for value in stereo]
+            
+            if any(hit is None for hit in hits):
+                warnings.warn(f"Missing fragment for atom '{names[index]}' "
+                              f"in residue type '{res_name[index]}' "
+                              f"at position {index}; "
+                              "no hydrogens generated for this atom.")
+                continue
+            
+            hydrogen_counts = [len(hit[3]) for hit in hits]
+            
+            if len(set(hydrogen_counts)) != 1:
+                raise ValueError("Inconsistent hydrogen counts across samples "
+                                 f"for atom {index}.")
                 
-                    
-        tar_frag_heavy_coord = displacement(
-            tar_frag_center_coord[:, :, None, :], tar_frag_heavy_coord
-        )
+            count = hydrogen_counts[0]
+            
+            # No rotation is needed for atoms bearing no hydrogens.
+            if count == 0:
+                continue
+            
+            if count > 4:
+                raise ValueError(f"More than four hydrogens for atom {index}.")
                 
-        # Get the rotation matrix required for superimposition of
-        # the reference coord to the target coord
-        matrices = _get_rotation_matrices_batch(tar_frag_heavy_coord, ref_frag_heavy_coord, test)
-
-        # Rotate the reference hydrogen atoms, so they fit the
-        # target heavy atoms
-        tar_frag_hydrogen_coord = _rotate_batch(ref_frag_hydrogen_coord, matrices)
-
-        # Translate hydrogen atoms to the position of the
-        # non-centered central heavy target atom
-        mask = (tar_frag_hydrogen_coord.abs().sum(dim=-1) != 0)
-        expanded_center_coord = tar_frag_center_coord[:, :, None, :] 
-        tar_frag_hydrogen_coord = torch.where(mask.unsqueeze(-1), tar_frag_hydrogen_coord + expanded_center_coord, tar_frag_hydrogen_coord)
-
-        tar_frag_hydrogen_coord = list(tar_frag_hydrogen_coord)
-        # Turn into list and remove NaN paddings
-        tar_frag_hydrogen_coord = [[
-            # If the x-coordinate is NaN it is expected that
-            # y and z are also NaN
-            coord[~(coord == 0).all(dim=1)]
-            for coord in sample] for sample in tar_frag_hydrogen_coord]
-
-        naming_sample = tar_frag_hydrogen_coord[0]
-        tar_frag_hydrogen_coord = torch.stack([torch.cat(s, dim=0) for s in tar_frag_hydrogen_coord], dim=0)
-        return tar_frag_hydrogen_coord, naming_sample
+            reference = torch.as_tensor(np.stack([hit[2] for hit in hits]), 
+                                        dtype=coords.dtype, device=coords.device,)
+            hydrogen = torch.as_tensor(np.stack([hit[3] for hit in hits]), 
+                                       dtype=coords.dtype, device=coords.device,)
+            
+            if not (torch.isfinite(reference).all() and torch.isfinite(hydrogen).all()):
+                raise ValueError(f"Nonfinite reference fragment for atom {index}.")
+                
+            active_atoms.append(index)
+            counts.append(count)
+            centers.append(center)
+            targets.append(heavy - center[:, None, :])
+            references.append(reference)
+            
+            padding = coords.new_zeros((batch_size, 4 - count, 3))
+            hydrogen_references.append(torch.cat([hydrogen, padding], dim=1))
+            
+        naming_sample = [coords.new_empty((0, 3)) for _ in range(atom_count)]
+        
+        if not active_atoms:
+            return coords[:, :0, :], naming_sample
+        
+        centers = torch.stack(centers, dim=1)
+        targets = torch.stack(targets, dim=1)
+        references = torch.stack(references, dim=1)
+        hydrogen_references = torch.stack(hydrogen_references, dim=1)
+        
+        matrices = _get_rotation_matrices_batch(targets, references, test)
+        rotated = _rotate_batch(hydrogen_references, matrices)
+        generated = rotated + centers[:, :, None, :]
+        
+        parts = []
+        
+        for active_index, (atom_index, count) in enumerate(zip(active_atoms, counts)):
+            hydrogen = generated[:, active_index, :count, :]
+            
+            if not torch.isfinite(hydrogen).all():
+                raise ValueError("Nonfinite generated hydrogen coordinates "
+                                 f"for atom {atom_index} ({res_name[atom_index]}:"
+                                 f"{names[atom_index]}).")
+            
+            parts.append(hydrogen)
+            naming_sample[atom_index] = hydrogen[0]
+            
+        return torch.cat(parts, dim=1), naming_sample
+                
     
 def _fragment(coords, bonds, names, elements, res_name, device):
     """
@@ -548,7 +556,7 @@ def _get_rotation_matrices_batch(fixed, mobile, test):
         v = torch.from_numpy(v).to(dev)
         w = torch.from_numpy(w).to(dev) 
     else:
-        v, s, w = torch.linalg.svd(cov, full_matrices=True, driver="gesvdj")
+        v, s, w = torch.linalg.svd(cov, full_matrices=True)
     
     # Remove possibility of reflected atom coordinates
     reflected_mask = torch.det(v) * torch.det(w) < 0
@@ -734,6 +742,14 @@ def _fragment_batch(coords, bonds, names, elements, res_name, device):
             rem_bond_indices = rem_bond_indices[rem_bond_indices != -1]
             rem_heavy_mask = elements[rem_bond_indices] != "H"
             rem_heavy_indices = rem_bond_indices[rem_heavy_mask]
+            
+            # The extra atom must not be the central atom itself.
+            rem_heavy_indices = rem_heavy_indices[rem_heavy_indices != i]
+            
+            if len(rem_heavy_indices) == 0:
+                raise ValueError("No second heavy atom defines the hydrogen orientation "
+                                 f"for atom {i} ({res_name[i]}:{names[i]}).")
+            
             # Use the coord of any heavy atom bonded to the remote
             # atom
             rem_rem_index = rem_heavy_indices[0]
@@ -751,7 +767,8 @@ def _fragment_batch(coords, bonds, names, elements, res_name, device):
             # For performance reasons, the result does not follow the
             # R/S nomenclature, but a custom -1/1 based one, which also
             # unambiguously identifies the enantiomer
-            n = torch.cross(heavy_coord[:, 0] - center, heavy_coord[:, 1] - center)
+            n = torch.cross(heavy_coord[:, 0] - center, 
+                            heavy_coord[:, 1] - center, dim=-1)
             sign = torch.sign(((heavy_coord[:, 2] - center) * n).sum(dim=-1))
             stereo = sign.detach().cpu()
         elif n_heavy_bonds == 4:
