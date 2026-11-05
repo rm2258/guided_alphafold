@@ -30,6 +30,11 @@ from ...openfold_local.utils.checkpointing import get_checkpoint_fn
 
 import torch.utils.checkpoint as checkpoint
 
+def _check_diffusion_finite(stage, **values):
+    for name, value in values.items():
+        if not torch.isfinite(value).all().item():
+            raise ValueError(f"Nonfinite diffusion tensor: {stage}.{name}; "
+                             f"shape={tuple(value.shape)}, dtype={value.dtype}")
 
 class DiffusionConditioning(nn.Module):
     """
@@ -424,6 +429,8 @@ class DiffusionModule(nn.Module):
                 z_trunk=z_trunk,
                 inplace_safe=inplace_safe,
             )  # [..., N_sample, N_token, c_s], [..., N_token, N_token, c_z]
+            
+        _check_diffusion_finite("conditioning", s_single=s_single, z_pair=z_pair,)
 
         # Expand embeddings to match N_sample
         s_trunk = expand_at_dim(
@@ -454,6 +461,10 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+            
+        _check_diffusion_finite("atom_encoder", a_token=a_token, q_skip=q_skip, 
+                                c_skip=c_skip, p_skip=p_skip,)
+            
         # Full self-attention on token level.
         if inplace_safe:
             a_token += self.linear_no_bias_s(
@@ -463,6 +474,9 @@ class DiffusionModule(nn.Module):
             a_token = a_token + self.linear_no_bias_s(
                 self.layernorm_s(s_single)
             )  # [..., N_sample, N_token, c_token]
+        
+        _check_diffusion_finite("transformer_input", a_token=a_token,)
+        
         a_token = self.diffusion_transformer(
             a=a_token,
             s=s_single,
@@ -470,8 +484,12 @@ class DiffusionModule(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
+        
+        _check_diffusion_finite("transformer_output", a_token=a_token,)
 
         a_token = self.layernorm_a(a_token)
+        
+        _check_diffusion_finite("transformer_normalization", a_token=a_token,)
 
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
@@ -497,6 +515,8 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
+            
+        _check_diffusion_finite("atom_decoder", r_update=r_update)
 
         return r_update
 
@@ -540,6 +560,8 @@ class DiffusionModule(nn.Module):
             x_noisy
             / torch.sqrt(self.sigma_data**2 + t_hat_noise_level**2)[..., None, None]
         )
+        
+        _check_diffusion_finite("input_scaling", r_noisy=r_noisy)
 
         # Compute the update given r_noisy (the scaled x_noisy)
         # As in EDM:
@@ -571,5 +593,7 @@ class DiffusionModule(nn.Module):
             1 / (1 + s_ratio**2) * x_noisy
             + t_hat_noise_level[..., None, None] / torch.sqrt(1 + s_ratio**2) * r_update
         ).to(r_update.dtype)
+        
+        _check_diffusion_finite("output_scaling", r_update=r_update, x_denoised=x_denoised,)
 
         return x_denoised
