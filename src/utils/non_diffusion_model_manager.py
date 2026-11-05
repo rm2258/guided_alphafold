@@ -616,6 +616,30 @@ class ProtenixModelManager:
             t_hat = self.get_t_hat(start_index)
         msa = msa or self.msa
         input_feature_dict = input_feature_dict or self.input_feature_dict
+        def check_finite(value, path):
+            if isinstance(value, torch.Tensor):
+                if value.is_floating_point() or value.is_complex():
+                    if not torch.isfinite(value).all().item():
+                        raise ValueError(f"Nonfinite denoiser input: {path}; "
+                                         f"shape={tuple(value.shape)}, dtype={value.dtype}")
+            elif isinstance(value, dict):
+                for key, item in value.items():
+                    check_finite(item, f"{path}.{key}")
+            elif isinstance(value, (list, tuple)):
+                for index, item in enumerate(value):
+                    check_finite(item, f"{path}[{index}]")
+        
+        check_finite(x_noisy, "x_noisy")
+        check_finite(t_hat, "t_hat")
+        check_finite(msa.s_inputs, "msa.s_inputs")
+        check_finite(msa.s, "msa.s")
+        check_finite(msa.z, "msa.z")
+        check_finite(input_feature_dict, "input_feature_dict")
+        
+        if not (t_hat > 0).all().item():
+            raise ValueError(f"Denoiser noise level must be positive; "
+                             f"received {t_hat.detach().cpu().tolist()}")
+            
         return self.denoise_net(
                     x_noisy=x_noisy,
                     t_hat_noise_level=t_hat.reshape([1]).repeat(x_noisy.shape[0]),
