@@ -458,8 +458,20 @@ class ProtenixModelManager:
                     if self.pairformer_mixed_precision: 
                         s = s.to(torch.bfloat16)
                         z = z.to(torch.bfloat16)
-                    for _ in tqdm(range(self.N_cycle), desc="Pairformer Cycle"):
+                    interactive_progress = sys.stderr.isatty()
+                    for cycle in tqdm(range(self.N_cycle), desc="Pairformer Cycle", disable=not interactive_progress):
+                        if not interactive_progress:
+                            print(f"Pairformer cycle {cycle + 1}/{self.N_cycle}: started", flush=True)
+                        
                         s,z = self.pairformer_cycle(s,z)
+                        
+                        if not torch.isfinite(s).all().item() or not torch.isfinite(z).all().item():
+                            raise ValueError(f"Nonfinite Pairformer representations after cycle "
+                                             f"{cycle + 1}/{self.N_cycle}")
+                            
+                        if not interactive_progress:
+                            print(f"Pairformer cycle {cycle + 1}/{self.N_cycle}: completed", flush=True)
+                            
                 if self.pairformer_mixed_precision:
                     s = s.to(torch.float32)
                     z = z.to(torch.float32)

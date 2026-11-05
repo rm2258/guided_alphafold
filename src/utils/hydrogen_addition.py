@@ -271,13 +271,23 @@ class FragmentLibrary:
             
             element, stereo, bond_types, center, heavy, _ = fragment
             
-            hits = [self._frag_dict.get((element, 0, int(value), tuple(bond_types))) for value in stereo]
+            keys = [
+                (str(element), 0, int(value), tuple(int(t) for t in bond_types)) 
+                for value in stereo
+                ]
+            hits = [self._frag_dict.get(key) for key in keys]
             
-            if any(hit is None for hit in hits):
-                warnings.warn(f"Missing fragment for atom '{names[index]}' "
-                              f"in residue type '{res_name[index]}' "
-                              f"at position {index}; "
-                              "no hydrogens generated for this atom.")
+            missing_keys = sorted({
+                key for key, hit in zip(keys, hits) 
+                if hit is None
+                })
+            if missing_keys:
+                warnings.warn(f"Missing hydrogen fragment: "
+                              f"atom_index={index}, "
+                              f"residue={res_name[index]}, "
+                              f"atom={names[index]}, "
+                              f"missing_keys={missing_keys}. "
+                              "No hydrogens generated for this atom.")
                 continue
             
             hydrogen_counts = [len(hit[3]) for hit in hits]
@@ -775,7 +785,8 @@ def _fragment_batch(coords, bonds, names, elements, res_name, device):
             # The fragment is irrelevant, as there is no bonded hydrogen
             # -> The fragment coord is the coord of the central atom
             # 4 times repeated
-            heavy_coord = torch.repeat(coords[:, None, i, :], 3, axis=0)
+            # heavy_coord = torch.repeat(coords[:, None, i, :], 3, axis=0)
+            heavy_coord = coords[:, [i, i, i]]
             stereo = torch.zeros((coords.shape[0]))
         else:
             warnings.warn(
@@ -783,7 +794,8 @@ def _fragment_batch(coords, bonds, names, elements, res_name, device):
                 f"'{res_name[i]}' has more than 4 bonds to "
                 f"heavy atoms ({n_heavy_bonds}) and is ignored"
             )
-            heavy_coord = torch.repeat(coords[:, None, i, :], 3, axis=0)
+            # heavy_coord = torch.repeat(coords[:, None, i, :], 3, axis=0)
+            heavy_coord = coords[:, [i, i, i]]
             hydrogen_coord = torch.zeros((0, 3), dtype=torch.float32, device=device)
             stereo = torch.zeros((coords.shape[0]))
         central_coord = coords[:, i]

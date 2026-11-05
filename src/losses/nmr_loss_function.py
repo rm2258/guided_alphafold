@@ -2,6 +2,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import sys
 import numpy as np
 import pandas as pd
 import torch
@@ -246,7 +247,8 @@ class NMRLossFunction(AbstractLossFunction):
     def _build_guidance_params(self) -> List[Tuple[int, str, str, int, str, str]]:
         """(res1_num, res1_id, atom1, res2_num, res2_id, atom2) per restraint row."""
         out = []
-        for _, row in tqdm(self.nmr_data.iterrows(), total=len(self.nmr_data), desc="generating comparison indices"):
+        for _, row in tqdm(self.nmr_data.iterrows(), total=len(self.nmr_data), desc="generating comparison indices", 
+                           disable=not sys.stderr.isatty(),):
             out.append(
                 (
                     row["residue1_num"],

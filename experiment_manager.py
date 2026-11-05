@@ -430,7 +430,16 @@ class ExperimentManager:
             if self.config.general.apply_diffusion_guidance and i > start_guidance_from:      
                 structures.requires_grad = True
 
+            if not torch.isfinite(structures).all().item():
+                raise ValueError(f"Nonfinite sampling coordinates before denoising: "
+                                 f"step={step + 1}, diffusion_index={i}")
+            
             x_0_hat = self.model_manager.get_x_0_hat_from_x_noisy(structures, start_index=i, inplace_safe=False)
+            
+            if not torch.isfinite(x_0_hat).all().item():
+                raise ValueError(f"Nonfinite denoiser output: "
+                                 f"step={step + 1}, diffusion_index={i}")
+            
             guidance_direction = None
 
             start_idx = schedule[step]
