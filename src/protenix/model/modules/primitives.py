@@ -33,7 +33,7 @@ from ...openfold_local.utils.chunk_utils import chunk_layer
 LinearNoBias = partial(Linear, bias=False)
 
 def _check_attention_finite(stage, **values):
-    for name, value in values.item():
+    for name, value in values.items():
         if not torch.isfinite(value).all().item():
             raise ValueError(f"Nonfinite attention tensor: {stage}.{name}; "
                              f"shape={tuple(value.shape)}, dtype={value.dtype}")
