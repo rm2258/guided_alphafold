@@ -215,7 +215,7 @@ def _attention(
         else:
             attn_weights = attn_weights + attn_bias
 
-    if torch.isnan(attn_weights.any().item()):
+    if torch.isnan(attn_weights).any().item():
         raise ValueError("NaN attention scores after adding pair bias.")
         
     if torch.isposinf(attn_weights).any().item():
