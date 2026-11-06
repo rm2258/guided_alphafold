@@ -35,7 +35,12 @@ from ...model.utils import (
 from ...openfold_local.model.primitives import LayerNorm
 from ...openfold_local.utils.checkpointing import checkpoint_blocks
 
-
+def _check_transformer_finite(stage, **values):
+    for name, value in values.items():
+        if not torch.isfinite(value).all().item():
+            raise ValueError(f"Nonfinite transformer tensor: {stage}.{name}; "
+                             f"shape={tuple(value.shape)}, dtype={value.dtype}")
+    
 class AttentionPairBias(nn.Module):
     """
     Implements Algorithm 24 in AF3
@@ -174,8 +179,12 @@ class AttentionPairBias(nn.Module):
         bias = self.linear_nobias_z(self.layernorm_z(z))
         bias = permute_final_dims(bias, [2, 0, 1])  # [..., n_heads, N_token, N_token]
 
+        _check_transformer_finite("attention_inputs", a=a, bias=bias)
+        
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         a = self.attention(q_x=a, kv_x=a, attn_bias=bias, inplace_safe=inplace_safe)
+        
+        _check_transformer_finite("attention_core_output", a=a)
 
         return a
 
@@ -196,6 +205,7 @@ class AttentionPairBias(nn.Module):
         else:
             a = self.layernorm_a(a)
 
+        _check_transformer_finite("attention_normalization", a=a)
         # Multihead attention with pair bias
         if n_queries and n_keys:
             a = self.local_multihead_attention(
@@ -279,6 +289,8 @@ class DiffusionTransformerBlock(nn.Module):
             torch.Tensor: the output of DiffusionTransformerBlock
                 [..., N, c_a]
         """
+        _check_transformer_finite("block_input", a=a, s=s, z=z)
+        
         attn_out = self.attention_pair_bias(
             a=a,
             s=s,
@@ -288,12 +300,21 @@ class DiffusionTransformerBlock(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
         )
+        _check_transformer_finite("attention_output", attn_out=attn_out)
+        
         if inplace_safe:
             attn_out += a
         else:
             attn_out = attn_out + a
+            
+        _check_transformer_finite("attention_residual", attn_out=attn_out)
+        
         ff_out = self.conditioned_transition_block(a=attn_out, s=s)
+        _check_transformer_finite("transition_output", ff_out=ff_out)
+        
         out_a = ff_out + attn_out
+        _check_transformer_finite("transition_residual", out_a=out_a)
+        
         # Avoid s/z to be deleted by torch.utils.checkpoint
         return out_a, s, z
 

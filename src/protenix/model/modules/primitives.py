@@ -32,6 +32,11 @@ from ...openfold_local.utils.chunk_utils import chunk_layer
 
 LinearNoBias = partial(Linear, bias=False)
 
+def _check_attention_finite(stage, **values):
+    for name, value in values.item():
+        if not torch.isfinite(value).all().item():
+            raise ValueError(f"Nonfinite attention tensor: {stage}.{name}; "
+                             f"shape={tuple(value.shape)}, dtype={value.dtype}")
 
 class AdaptiveLayerNorm(nn.Module):
     """
@@ -202,6 +207,7 @@ def _attention(
 
     # [..., n_q, d], [..., d, n_kv] -> [..., n_q, n_kv]
     attn_weights = q @ k
+    _check_attention_finite("query_key_product", scores=attn_weights)
 
     if attn_bias is not None:
         if inplace_safe:
@@ -209,11 +215,22 @@ def _attention(
         else:
             attn_weights = attn_weights + attn_bias
 
+    if torch.isnan(attn_weights.any().item()):
+        raise ValueError("NaN attention scores after adding pair bias.")
+        
+    if torch.isposinf(attn_weights).any().item():
+        raise ValueError("Positive-infinite attention scores.")
+        
+    if torch.isneginf(attn_weights).all(dim=-1).any().item():
+        raise ValueError("An attention row has no unmasked finite scores.")
+        
     # [..., n_q, n_kv]
     attn_weights = F.softmax(attn_weights, dim=-1)
+    _check_attention_finite("softmax", probabilities=attn_weights)
 
     # [..., n_q, n_kv], [..., n_kv, d] -> [..., n_q, d]
     attn_output = attn_weights @ v
+    _check_attention_finite("weighted_values", output=attn_output)
 
     return attn_output
 
@@ -658,6 +675,7 @@ class Attention(nn.Module):
         q = self.linear_q(q_x)
         k = self.linear_k(kv_x)
         v = self.linear_v(kv_x)
+        _check_attention_finite("projection", q=q, k=k, v=v)
 
         # [*, Q/K/V, H, C_hidden]
         q = q.view(q.shape[:-1] + (self.num_heads, -1))
