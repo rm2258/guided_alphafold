@@ -176,7 +176,16 @@ class AttentionPairBias(nn.Module):
         """
 
         # Multi-head attention bias
+        _check_transformer_finite("pair_bias_input", z=z)
+        
+        normalized_z = self.layernorm_z(z)
+        _check_transformer_finite("pair_bias_normalization", normalized_z=normalized_z,)
+        
+        _check_transformer_finite("pair_bias_projection_parameters", weight=self.linear_nobias_z.weight,)
+        
         bias = self.linear_nobias_z(self.layernorm_z(z))
+        _check_transformer_finite("pair_bias_projection", bias=bias)
+        
         bias = permute_final_dims(bias, [2, 0, 1])  # [..., n_heads, N_token, N_token]
 
         _check_transformer_finite("attention_inputs", a=a, bias=bias)
