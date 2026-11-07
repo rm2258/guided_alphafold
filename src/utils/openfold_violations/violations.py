@@ -190,6 +190,8 @@ def find_structural_violations(
                 "per_residue_violation_mask"
             ],  # (N)
             "clashes_mean_loss": between_residue_clashes["mean_loss"],  # ()
+            "clashes_loss_sum": between_residue_clashes["loss_sum"],
+            "clashes_mask_sum": between_residue_clashes["mask_sum"], # now can combine ensemble members later
             "clashes_per_atom_loss_sum": between_residue_clashes[
                 "per_atom_loss_sum"
             ],  # (N, 14)
@@ -426,7 +428,9 @@ def between_residue_clash_loss(
 
     # Compute the mean loss.
     # shape ()
-    mean_loss = torch.sum(dists_to_low_error) / (1e-6 + torch.sum(dists_mask))
+    loss_sum = torch.sum(dists_to_low_error)
+    mask_sum = torch.sum(dists_mask)
+    mean_loss = loss_sum / (1e-6 + mask_sum)
 
     # Compute the per atom loss sum.
     # shape (N, 14)
@@ -451,6 +455,8 @@ def between_residue_clash_loss(
 
     return {
         "mean_loss": mean_loss,  # shape ()
+        "loss_sum": loss_sum,
+        "mask_sum": mask_sum,
         "per_atom_loss_sum": per_atom_loss_sum,  # shape (N, 14)
         "per_atom_clash_mask": per_atom_clash_mask,  # shape (N, 14)
         "per_atom_num_clash": per_atom_num_clash  # shape (N, 14)
