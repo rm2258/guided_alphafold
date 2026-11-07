@@ -465,12 +465,6 @@ class ExperimentManager:
                     
                     if audit_step and self.nmr_loss_function is not None:
                         nmr_value = self.nmr_loss_function.last_value
-                        
-                        if nmr_value.requires_grad:
-                            nmr_gradient = torch.autograd.grad(nmr_value, structures, retain_graph=True, allow_unused=True,)[0]
-                        else:
-                            nmr_gradient = None
-                            
                         nmr_config = self.config.loss_function.nmr_loss_function
                         
                         audit = {
@@ -480,30 +474,20 @@ class ExperimentManager:
                             "nmr_loss": float(nmr_value.detach().item()),
                             "nmr_weight": float(getattr(nmr_config, "weight", 1)),
                             "noe_scale": float(nmr_config.noe_scale),
-                            "nmr_connected_to_sampling_coordinates": nmr_gradient is not None,
-                            "nmr_gradient_norm": float(nmr_gradient.detach().norm().item()) if nmr_gradient is not None else None,
-                            "nmr_gradient_finite": bool(torch.isfinite(nmr_gradient).all().item()) if nmr_gradient is not None else None,
-                                 }
-                        pre_loss = self.nmr_loss_function.pre_loss
+                            "component_gradient_audit_enabled": False,
+                            }
                         
-                        if pre_loss.has_restraints:
-                            pre_value = pre_loss.last_value
-                            
-                            pre_gradient = (
-                                torch.autograd.grad(pre_value, structures, retain_graph=True, 
-                                                    allow_unused=True,)[0] 
-                                if pre_value.requires_grad else None
-                                )
-                            
+                        pre_loss = getattr(self.nmr_loss_function, "pre_loss", None)
+                        if pre_loss is not None and pre_loss.has_restraints:
                             audit.update({
-                                "pre_loss": float(pre_value.detach().item()),
-                                "pre_scale": pre_loss.scale,
+                                "pre_loss": float(pre_loss.last_value.detach().item()),
+                                "pre_scale": float(pre_loss.scale),
                                 "pre_ensemble_mode": pre_loss.ensemble_mode,
-                                "pre_connected_to_sampling_coordinates": pre_gradient is not None,
-                                "pre_gradient_norm": float(pre_gradient.detach().norm().item()) if pre_gradient is not None else None,
-                                "pre_gradient_finite": bool(torch.isfinite(pre_gradient).all().item()) if pre_gradient is not None else None,
                                 })
+                    
+                    # backward pass used for guidance    
                     loss_value.backward()
+                    
                     if audit is not None:
                         gradient = structures.grad
                         audit["total_gradient_norm"] = float(gradient.detach().norm().item()) if gradient is not None else None
@@ -513,7 +497,7 @@ class ExperimentManager:
                         with open(audit_path, "a") as handle:
                             handle.write(json.dumps(audit) + "\n")
                             
-                        print("[guidance audit] " + json.dumps(audit))
+                        print("[guidance audit] " + json.dumps(audit), flush=True)
                         
                     if interactive_progress:
                         steps_generator.set_description(f"running diffusion process, loss: {loss_value.item():.5f}")
