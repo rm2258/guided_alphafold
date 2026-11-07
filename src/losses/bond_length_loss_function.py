@@ -1,16 +1,27 @@
-from .abstract_loss_funciton import AbstractLossFunction
-import torch
-from biotite.structure import connect_via_residue_names
 import numpy as np
 import gemmi
+import torch
+from torch.utils.checkpoint import checkpoint
+
+from .abstract_loss_funciton import AbstractLossFunction
+from biotite.structure import connect_via_residue_names
 
 class BondLengthLossFunction(AbstractLossFunction):
-    def __init__(self, atom_array_object, device):
+    def __init__(self, atom_array_object, device, collision_chunk_size=64):
         self._device = device
         self._atom_array_object = atom_array_object
+        self._collision_chunk_size = int(collision_chunk_size)
+        
+        if self._collision_chunk_size < 1:
+            raise ValueError("collision_chunk_size must be positive.")
+        
         self._bonds, self._bond_lengths = self._initialize_topolgy_bonds()
-        self._collision_distances = self._initialize_collision_distances()
-
+        
+        # store one radius per atom instead of an atom-by-atom matrix
+        radii = np.array([gemmi.Element(atom.element).covalent_r
+                          for atom in atom_array_object])
+        self._atom_covalent_r = torch.as_tensor(radii, device=device)
+        
         self._last_bond_length_loss = None
         self._last_collision_loss = None
 
@@ -46,31 +57,74 @@ class BondLengthLossFunction(AbstractLossFunction):
         return (atom_covalent_r[None] + atom_covalent_r[:, None])
     
     def bond_length_loss(self, atom_locations, threshold=0.2 , l=2):
-        bond_lengths = (atom_locations[:, self._bonds[...,0]] - atom_locations[:, self._bonds[...,1]]).norm(dim=-1)
-        bond_lengths_diff = ((bond_lengths - self._bond_lengths).abs() - threshold).relu()
-        return bond_lengths_diff.pow(l).sum() / atom_locations.shape[0]
+        bond_lengths = (atom_locations[:, self._bonds[:, 0]] - atom_locations[:, self._bonds[:, 1]]).norm(dim=-1)
+        
+        errors = ((bond_lengths - self._bond_lengths).abs() - threshold).relu()
+        return errors.pow(l).sum() / atom_locations.shape[0]
+    
+    def _collision_block(self, atom_locations, start, stop, padding):
+        distances = (atom_locations[:, start:stop, None, :] - atom_locations[:, None, :, :]).norm(dim=-1)
+        
+        atom_count = atom_locations.shape[1]
+        
+        # The same mask applies to every ensemble member.
+        mask = atom_locations.new_zeros((stop - start, atom_count))
+        
+        diagonal = torch.arange(start, stop, device=atom_locations.device)
+        mask[diagonal - start, diagonal] = 3
+        
+        first = self._bonds[:, 0]
+        second = self._bonds[:, 1]
+        selected = (first >= start) & (first < stop)
+        mask[first[selected] - start, second[selected]] = 3
+        
+        selected = (second >= start) & (second < stop)
+        mask[second[selected] - start, first[selected]] = 3
+        
+        distances = distances + mask
+        
+        collision_distances = self._atom_covalent_r[start:stop, None] + self._atom_covalent_r[None, :]
+        
+        # Keep the original maximum across the ensemble
+        violations = (collision_distances + padding - distances).max(dim=0)[0].relu()
+        return violations.sum()
     
     def collision_loss(self, atom_locations, padding = 0.4):
-        distances = (atom_locations[:,:, None] - atom_locations[:,None]).norm(dim=-1)
-        mask = torch.zeros_like(distances)
-        mask[:, self._bonds[...,0], self._bonds[...,1]] = 3
-        mask[:, self._bonds[...,1], self._bonds[...,0]] = 3
-        diagonal = torch.arange(atom_locations.shape[1], device=atom_locations.device,)
-        mask[:, diagonal, diagonal] = 3
-        distances = distances + mask
-        threshold_loss = (self._collision_distances + padding - distances).max(dim=0)[0].relu()
-        return threshold_loss.sum() / atom_locations.shape[0]
+        batch_size, atom_count = atom_locations.shape[:2]
+        
+        if batch_size == 0:
+            raise ValueError("Collision loss requires at least one sample.")
+            
+        total = atom_locations.new_zeros((), dtype=self._atom_covalent_r.dtype)
+        
+        for start in range(0, atom_count, self._collision_chunk_size):
+            stop = min(start + self._collision_chunk_size, atom_count)
+            
+            if torch.is_grad_enabled() and atom_locations.requires_grad:
+                block_loss = checkpoint(self._collision_block, atom_locations, 
+                                        start, stop, padding, use_reentrant=False)
+            else:
+                block_loss = self._collision_block(atom_locations, start, stop, padding)
+                
+            total = total + block_loss
+        
+        return total / batch_size
     
     def get_bond_loss(self, atom_locations):
-        bond_length_loss = self.bond_length_loss(atom_locations)
+        bond_loss = self.bond_length_loss(atom_locations)
         collision_loss = self.collision_loss(atom_locations)
-        loss_values = bond_length_loss + collision_loss
-        self._last_bond_length_loss = bond_length_loss.item()
-        self._last_collision_loss = collision_loss.item()
+        
+        self._last_bond_length_loss = bond_loss.detach().item()
+        self._last_collision_loss = collision_loss.detach().item()
+        
+        loss_values = bond_loss + collision_loss
         return loss_values 
     
     def __call__(self, x_0_hat, time, structures=None, i=None, step=None):
         return self.get_bond_loss(x_0_hat), None
     
     def wandb_log(self, x_0_hat):
-        return {"bond length loss": self._last_bond_length_loss, "collision loss": self._last_collision_loss}
+        return {"bond length loss": self._last_bond_length_loss, 
+                "collision loss": self._last_collision_loss}
+    
+    
