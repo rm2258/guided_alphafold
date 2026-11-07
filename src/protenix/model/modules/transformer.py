@@ -36,8 +36,31 @@ from ...openfold_local.model.primitives import LayerNorm
 from ...openfold_local.utils.checkpointing import checkpoint_blocks
 
 def _check_transformer_finite(stage, **values):
+    max_chunk_elements = 1_000_000
+    
+    def chunks(tensor):
+        if tensor.numel() <= max_chunk_elements:
+            yield tensor
+            return
+        
+        # Slice without flattening or copying an expanded tensor.
+        axis = max(range(tensor.ndim), key=lambda index: tensor.shape[index],)
+        size = max(1, tensor.shape[axis] // 2)
+        
+        for part in tensor.split(size, dim=axis):
+            yield from chunks(part)
+    
     for name, value in values.items():
-        if not torch.isfinite(value).all().item():
+        with torch.no_grad():
+            finite = torch.ones((), dtype=torch.bool, device=value.device)
+            
+            for part in chunks(value):
+                finite.logical_and_(torch.isfinite(part).all())
+                
+            valid = finite.item()
+        
+        
+        if not valid:
             raise ValueError(f"Nonfinite transformer tensor: {stage}.{name}; "
                              f"shape={tuple(value.shape)}, dtype={value.dtype}")
     
