@@ -201,13 +201,24 @@ class AttentionPairBias(nn.Module):
         # Multi-head attention bias
         _check_transformer_finite("pair_bias_input", z=z)
         
-        normalized_z = self.layernorm_z(z)
+        # A zero stride identifies the shared, broadcast sample dimension.
+        shared_samples = z.ndim >= 4 and z.shape[-4] > 1 and z.stride(-4) == 0
+        
+        if shared_samples:
+            z_for_bias = z.narrow(-4, 0, 1)
+        else:
+            z_for_bias = z
+        
+        normalized_z = self.layernorm_z(z_for_bias)
         _check_transformer_finite("pair_bias_normalization", normalized_z=normalized_z,)
         
         _check_transformer_finite("pair_bias_projection_parameters", weight=self.linear_nobias_z.weight,)
         
-        bias = self.linear_nobias_z(self.layernorm_z(z))
+        bias = self.linear_nobias_z(normalized_z)
         _check_transformer_finite("pair_bias_projection", bias=bias)
+        
+        if shared_samples:
+            bias = bias.expand(*z.shape[:-1], bias.shape[-1])
         
         bias = permute_final_dims(bias, [2, 0, 1])  # [..., n_heads, N_token, N_token]
 
