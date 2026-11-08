@@ -155,6 +155,10 @@ def main():
     parser.add_argument('--amide_relax_file', type=str, required=False, default=None)
     parser.add_argument('--methyl_relax_file', type=str, required=False, default=None)
     parser.add_argument('--device', type=str, required=False, default="cuda:0")
+    parser.add_argument("--denoising-devices", nargs="+", default=None, 
+                        help=("GPUs used to denoise ensemble members concurrently. "
+                              "The first must match --device. "
+                              "Example: cuda:0 cuda:1 cuda:2 cuda:3"))
     parser.add_argument(
         '--run-receipts',
         action='store_true',
@@ -283,6 +287,7 @@ def main():
         raise FileNotFoundError(f"NMR-AF3) Model weights not found: {config.model_manager.model_checkpoint_path}\n"
                 "Provide it with --model_weights_path or set AF3_MODEL_WEIGHTS.")
 
+    config.general.denoising_devices = args.denoising_devices
     # Seeding the experiment (unchanged baseline reproducibility)
     ExperimentManager.seed_experiment(config.general.seed)
 

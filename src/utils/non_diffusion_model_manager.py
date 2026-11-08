@@ -1,4 +1,5 @@
 import torch
+from torch.nn.parallel import parallel_apply, replicate
 from ..configs.configs_base import configs as configs_base
 from ..configs.configs_data import data_configs
 from ..configs.configs_inference import inference_configs
@@ -331,7 +332,7 @@ class ProtenixModelManager:
     def _load_cached_msa_embedding(self): # not configuration anymore, the prepared msa embeddings generated using msa configs etc...! 
         if self.ligands or self.covalent_bonds:
             return
-        file_path = os.path.join(self.msa_full_embedding_cache_dir, f"msa.pt")
+        file_path = os.path.join(self.msa_full_embedding_cache_dir, "msa.pt")
         if os.path.exists(file_path):
             self.msa = torch.load(file_path, weights_only=False)
             self.msa.to(self.device)
@@ -339,7 +340,7 @@ class ProtenixModelManager:
     def _save_cache_msa_embedding(self):
         if self.ligands or self.covalent_bonds:
             return
-        file_path = os.path.join(self.msa_full_embedding_cache_dir, f"msa.pt")
+        file_path = os.path.join(self.msa_full_embedding_cache_dir, "msa.pt")
         if not os.path.exists(file_path):
             os.makedirs(self.msa_full_embedding_cache_dir, exist_ok=True)
             self.msa.to("cpu")
@@ -608,15 +609,86 @@ class ProtenixModelManager:
             # Also, applying no guidance when adding the noise back (no need, will be applied during denoising anyway..!)
             return x_noisy
     
-    def get_x_0_hat_from_x_noisy(self, x_noisy, t_hat=None, start_index=None,msa=None,input_feature_dict=None, inplace_safe=False):
-        # make sure that t_hat is not None or t is not None, but not both
-        assert not ((t_hat is None) and (start_index is None))
-        assert not ((not t_hat is None) and (not start_index is None))
-        if t_hat is None:
-            t_hat = self.get_t_hat(start_index)
-        msa = msa or self.msa
-        input_feature_dict = input_feature_dict or self.input_feature_dict
-        def check_finite(value, path):
+    def configure_denoising_devices(self, devices=None):
+        """Create persistent denoiser replicas for ensemble parallelism."""
+        primary = self.noise_schedule.device
+        
+        if primary.type == "cuda" and primary.index is None:
+            primary = torch.device("cuda", torch.cuda.current_device())
+            
+        devices = [torch.device(value) for value in (devices or [primary])]
+        devices = [torch.device("cuda", torch.cuda.current_device()) 
+                   if device.type == "cuda" and device.index is None else device
+                   for device in devices]
+        
+        if not devices:
+            raise ValueError("At least one denoising device is required.")
+            
+        if devices[0] != primary:
+            raise ValueError(f"The first denoising device must match --device: {primary}.")
+            
+        if len(set(devices)) != len(devices):
+            raise ValueError("Denoising devices must be distinct.")
+            
+        if len(devices) > self.batch_size:
+            raise ValueError("The number of denoising devices cannot exceed "
+                             "the ensemble size.")
+            
+        if len(devices) > 1:
+            for device in devices:
+                if device.type != "cuda":
+                    raise ValueError("Multi-device denoising requires CUDA devices.")
+                if device.index >= torch.cuda.device_count():
+                    raise ValueError(f"Unavailable CUDA device: {device}")
+                    
+            if any(tensor.requires_grad 
+                   for tensor in (self.msa.s_inputs, self.msa.s, self.msa.z)):
+                raise ValueError("This ensemble-parallel path requires fixed trunk features.")
+        
+        # We differentiate with respect to sampling coordinates, not the pretrained
+        # denoiser weights.
+        self.denoise_net.eval()
+        self.denoise_net.requires_grad_(False)
+        
+        self._denoising_devices = devices
+        self._denoising_modules = [self.denoise_net]
+        self._denoising_contexts = [(self.input_feature_dict, self.msa)]
+        
+        if len(devices) > 1:
+            # Replicate directly to the other GPUs without first making a complete
+            # extra model copy on the primary GPU.
+            other_modules = replicate(self.denoise_net, devices=devices[1:], detach=True)
+            self._denoising_modules.extend(other_modules)
+            
+            def move(value, device):
+                if isinstance(value, torch.Tensor):
+                    return value.detach().to(device)
+                if isinstance(value, dict):
+                    return {key: move(item, device) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [move(item, device) for item in value]
+                if isinstance(value, tuple):
+                    return tuple(move(item, device) for item in value)
+                return value
+            
+            for device in devices[1:]:
+                features = move(self.input_feature_dict, device)
+                msa = MSA(self.msa.s_inputs.detach().to(device),
+                          self.msa.s.detach().to(device),
+                          self.msa.z.detach().to(device))
+                self._denoising_contexts.append((features, msa))
+            
+        self._denoising_static_inputs_checked = False
+        self._denoising_distribution_logged = False
+        
+        print("Denoising devices: " + ", ".join(str(device) for device in devices), flush=True)
+            
+    def _check_denoising_static_inputs(self):
+        """Check unchanged features once, rather than every diffusion step."""
+        if getattr(self, "_denoising_static_inputs_checked", False):
+            return
+        
+        def check(value, path):
             if isinstance(value, torch.Tensor):
                 if value.is_floating_point() or value.is_complex():
                     if not torch.isfinite(value).all().item():
@@ -624,32 +696,94 @@ class ProtenixModelManager:
                                          f"shape={tuple(value.shape)}, dtype={value.dtype}")
             elif isinstance(value, dict):
                 for key, item in value.items():
-                    check_finite(item, f"{path}.{key}")
+                    check(item, f"{path}.{key}")
             elif isinstance(value, (list, tuple)):
                 for index, item in enumerate(value):
-                    check_finite(item, f"{path}[{index}]")
-        
-        check_finite(x_noisy, "x_noisy")
-        check_finite(t_hat, "t_hat")
-        check_finite(msa.s_inputs, "msa.s_inputs")
-        check_finite(msa.s, "msa.s")
-        check_finite(msa.z, "msa.z")
-        check_finite(input_feature_dict, "input_feature_dict")
-        
-        if not (t_hat > 0).all().item():
-            raise ValueError(f"Denoiser noise level must be positive; "
-                             f"received {t_hat.detach().cpu().tolist()}")
+                    check(item, f"{path}[{index}]")
+                    
+        check(self.msa.s_inputs, "msa.s_inputs")
+        check(self.msa.s, "msa.s")
+        check(self.msa.z, "msa.z")
+        check(self.input_feature_dict, "input_feature_dict")
+        self._denoising_static_inputs_checked = True
+
+    def get_x_0_hat_from_x_noisy(self, x_noisy, t_hat=None, start_index=None, 
+                                 msa=None, input_feature_dict=None, inplace_safe=False):
+        # make sure that t_hat is not None or t is not None, but not both
+        if (t_hat is None) == (start_index is None):
+            raise ValueError("Supply exactly one of t_hat or start_index.")
             
-        return self.denoise_net(
-                    x_noisy=x_noisy,
-                    t_hat_noise_level=t_hat.reshape([1]).repeat(x_noisy.shape[0]),
-                    input_feature_dict=input_feature_dict,
-                    s_inputs=msa.s_inputs,
-                    s_trunk=msa.s,
-                    z_trunk=msa.z,
-                    chunk_size=self.chunk_size,
-                    inplace_safe=inplace_safe,
-                )
+        if t_hat is None:
+            t_hat = self.get_t_hat(start_index)
+            
+        if not torch.isfinite(x_noisy).all().item():
+            raise ValueError("Nonfinite sampling coordinates entering denoiser.")
+            
+        if not torch.isfinite(t_hat).all().item():
+            raise ValueError("Nonfinite denoiser noise level.")
+            
+        if t_hat.numel() != 1 or not (t_hat > 0).all().item():
+            raise ValueError("Denoiser noise level must be one positive scalar.")
+            
+        if not hasattr(self, "_denoising_devices"):
+            self.configure_denoising_devices()
+            
+        custom_context = ((msa is not None and msa is not self.msa) 
+                          or (input_feature_dict is not None 
+                              and input_feature_dict is not self.input_feature_dict))
+        
+        if custom_context and len(self._denoising_devices) > 1:
+            raise ValueError("Multi-GPU denoising currently requires the manager's "
+                             "fixed trunk features and input features.")
+            
+        self._check_denoising_static_inputs()
+        
+        if len(self._denoising_devices) == 1:
+            selected_msa = self.msa if msa is None else msa
+            features = self.input_feature_dict if input_feature_dict is None else input_feature_dict
+            
+            return self.denoise_net(x_noisy=x_noisy, 
+                                    t_hat_noise_level=t_hat.reshape(1).expand(x_noisy.shape[0]),
+                                    input_feature_dict=features, 
+                                    s_inputs=selected_msa.s_inputs, 
+                                    s_trunk=selected_msa.s, 
+                                    z_trunk=selected_msa.z, 
+                                    chunk_size=self.chunk_size, 
+                                    inplace_safe=inplace_safe,
+                                    )
+        
+        if x_noisy.device != self._denoising_devices[0]:
+            raise ValueError("sampling coordinates must be on the primary denoising device.")
+            
+        if x_noisy.shape[0] < len(self._denoising_devices):
+            raise ValueError("There must be at least one ensemble member per GPU.")
+            
+        chunks = torch.tensor_split(x_noisy, len(self._denoising_devices), dim=0)
+        kwargs = []
+        
+        for coordinates, device, context in zip(chunks, self._denoising_devices, self._denoising_contexts):
+            features, local_msa = context
+            kwargs.append({"x_noisy": coordinates.to(device), 
+                           "t_hat_noise_level": t_hat.to(device).reshape(1).expand(coordinates.shape[0]), 
+                           "input_feature_dict": features,
+                           "s_inputs": local_msa.s_inputs, 
+                           "s_trunk": local_msa.s, 
+                           "z_trunk": local_msa.z, 
+                           "chunk_size": self.chunk_size, 
+                           "inplace_safe": inplace_safe})
+            
+        if not self._denoising_distribution_logged:
+            distribution = ", ".join(f"{device}: {chunk.shape[0]} members" 
+                                     for device, chunk in zip(self._denoising_devices, chunks))
+            print(f"Ensemble denoising distribution: {distribution}", flush=True)
+            self._denoising_distribution_logged = True
+            
+        outputs = parallel_apply(self._denoising_modules, inputs=[()] * len(kwargs), 
+                                 kwargs_tup=kwargs, devices=self._denoising_devices)
+        
+        # These transfers remain in the autograd graph.
+        # Do not detach the outputs.
+        return torch.cat([output.to(x_noisy.device) for output in outputs], dim=0)
     
     def single_diffusion_step(self, x_t, start_index,end_index=None, inplace_safe=True, hook=None):
         x_noisy = self.get_x_noisy(x_t, start_index)

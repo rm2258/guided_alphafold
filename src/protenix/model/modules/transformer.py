@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 
 from functools import partial
 from typing import Optional, Union
@@ -49,6 +50,9 @@ def _check_transformer_finite(stage, **values):
         
         for part in tensor.split(size, dim=axis):
             yield from chunks(part)
+    
+    if os.environ.get("GUIDED_AF_DEBUG_FINITE", "0") != "1":
+        return
     
     for name, value in values.items():
         with torch.no_grad():

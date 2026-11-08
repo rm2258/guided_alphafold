@@ -98,6 +98,9 @@ class ExperimentManager:
         self.msa_full_save_dir = None
         self.query_msa_server()
         self.model_manager = self._get_model_manager()
+        self.model_manager.configure_denoising_devices(
+            getattr(self.config.general, "denoising_devices", None)
+            )
         self._setup_wandb()
         self.loss_function = self._get_loss_function()
 
