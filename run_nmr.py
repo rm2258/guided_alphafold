@@ -171,7 +171,20 @@ def main():
         default=False,
         help='Stricter deterministic path + run receipts (seed_experiment still always runs)',
     )
+    parser.add_argument("--diffusion-steps", type=int, default=None, 
+                        help="Set the number of diffusion sampling steps.")
+    parser.add_argument("--bond-length-loss-weight", type=float, default=None, 
+                        help="Set the weight of the combined bond-length/collision penalty.")
     args = parser.parse_args()
+    
+    if args.diffusion_steps is not None and args.diffusion_steps < 2:
+        parser.error("--diffusion-steps must be at least 2.")
+        
+    if args.bond_length_loss_weight is not None:
+        import math
+        
+        if not math.isfinite(args.bond_length_loss_weight) or args.bond_length_loss_weight < 0:
+            parser.error("--bond-length-loss-weight must be finite and nonnegative.")
 
     if args.sequence is not None and args.sequences is not None:
         parser.error("Use either --sequence (single chain) or --sequences (one or more), not both.")
@@ -250,6 +263,15 @@ def main():
 
     # Loading the config file and merging it with the arguments
     config = load_config(config_file_path)
+    if args.diffusion_steps is not None:
+        config.model_manager.diffusion_N = args.diffusion_steps
+    
+    if args.bond_length_loss_weight is not None:
+        config.loss_function.bond_length_loss_weight = args.bond_length_loss_weight
+    
+    print(f"Performing Diffusion steps: {config.model_manager.diffusion_N}", flush=True)
+    print(f"Bond-length/collision loss weight: {config.loss_function.bond_length_loss_weight}", flush=True)
+    
     # ligands and/or covalent bonds
     if args.inference_conf_file:
         try:

@@ -657,7 +657,7 @@ class ProtenixModelManager:
         if len(devices) > 1:
             # Replicate directly to the other GPUs without first making a complete
             # extra model copy on the primary GPU.
-            other_modules = replicate(self.denoise_net, devices=devices[1:], detach=True)
+            other_modules = replicate(self.denoise_net, devices=devices, detach=True)[1:]
             self._denoising_modules.extend(other_modules)
             
             def move(value, device):
