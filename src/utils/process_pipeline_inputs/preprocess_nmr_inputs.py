@@ -568,13 +568,13 @@ def validate_restraint_csv(df, source=""):
             f"(for inter-chain restraints) or neither (all restraints within-chain)."
         )
         
-    active = df[df["type"].isin(["NOE", "PRE"])]
+    active = df[df["type"].isin(["NOE", "PRE", "BOND"])]
 
     if active.empty:
         raise ValueError(f"Restraint file{where} contains no NOE or PRE rows.")
         
-    if (active["type"] == "PRE").any() and not has_chain1:
-        raise ValueError("PRE rows require chain1 and chain2 columns.")
+    if active["type"].isin(["PRE", "BOND"]).any() and not has_chain1:
+        raise ValueError("PRE/BOND rows require chain1 and chain2 columns.")
         
     if has_chain1:
         for column in ("chain1", "chain2"):
@@ -582,7 +582,7 @@ def validate_restraint_csv(df, source=""):
             invalid = labels.isna() | labels.isin(['', '.', '?'])
             
             if invalid.any():
-                raise ValueError(f"Every NOE/PRE row must specify {column} "
+                raise ValueError(f"Every NOE/PRE/BOND row must specify {column} "
                                  "when chain columns exist.")
             
             if (labels != active[column].astype("string")).any():
@@ -592,7 +592,7 @@ def validate_restraint_csv(df, source=""):
         values = active[column].astype("string").str.strip()
         
         if (values.isna() | values.isin(['', '.', '?'])).any():
-            raise ValueError(f"NOE/PRE rows have missing values in {column}.")
+            raise ValueError(f"NOE/PRE/BOND rows have missing values in {column}.")
             
     numeric = {}
     
@@ -605,18 +605,18 @@ def validate_restraint_csv(df, source=""):
         values = pd.to_numeric(values, errors="coerce")
         
         if values.isna().any() or not values.map(math.isfinite).all():
-            raise ValueError("NOE/PRE rows need finite numeric values "
+            raise ValueError("NOE/PRE/BOND rows need finite numeric values "
                              f"in {column}.")
         
         numeric[column] = values
         
     for column in ("constrain_id", "residue1_num", "residue2_num"):
         if (numeric[column] % 1 != 0).any():
-            raise ValueError(f"NOE/PRE values in {column} must be intergers.")
+            raise ValueError(f"NOE/PRE/BOND values in {column} must be intergers.")
     
     invalid_bounds = (numeric["lower_bound"] < 0) | (numeric["upper_bound"] < numeric["lower_bound"])
     if invalid_bounds.any():
-        raise ValueError("NOE/PRE bounds must satisfy "
+        raise ValueError("NOE/PRE/BOND bounds must satisfy "
                          "0 <= lower_bound <= upper_bound.")
         
     return int((active["type"] == "NOE").sum())
@@ -668,7 +668,7 @@ def expand_chain_selections(df):
     
     expanded = []
     for row_number, (_, row) in enumerate(df.iterrows(), start=2):
-        if row["type"] not in {"NOE", "PRE"}:
+        if row["type"] not in {"NOE", "PRE", "BOND"}:
             expanded.append(row.to_dict())
             continue
         
@@ -699,7 +699,7 @@ def expand_chain_selections(df):
     
     # PRE groups must have separate IDs for different chain pairs.
     # Preserve the original IDs for tracing the prepared rows.
-    pre_mask = result["type"].eq("PRE")
+    pre_mask = result["type"].isin(["PRE", "BOND"])
     
     if pre_mask.any():
         if "source_constrain_id" not in result.columns:
@@ -711,7 +711,7 @@ def expand_chain_selections(df):
         if ids.isna().any() or (ids % 1 != 0).any():
             raise ValueError("PRE constrain_id values must be integers.")
             
-        keys = pd.Series(list(zip(ids, pre["chain1"], pre["chain2"])))
+        keys = pd.Series(list(zip(pre["type"], ids, pre["chain1"], pre["chain2"])))
         
         result.loc[pre_mask, "constrain_id"] = pd.factorize(keys, sort=False)[0] + 1
         
@@ -765,7 +765,9 @@ def prepare_custom_restraints(restraints_path, conformation_id, input_directory,
     df.to_csv(csv_path, index=False)
     
     n_pre = int((df["type"] == "PRE").sum())
-    print(f"Prepared {n_noe} NOE and {n_pre} PRE restraints for '{conformation_id}' -> {csv_path}")
+    n_bond = int((df["type"] == "BOND").sum())
+    print(f"Prepared {n_noe} NOE, {n_pre} PRE, and {n_bond} BOND restraints"
+          f"for '{conformation_id}' -> {csv_path}", flush=True)
     return csv_path
 
 

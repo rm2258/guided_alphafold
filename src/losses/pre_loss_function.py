@@ -6,6 +6,7 @@ from .abstract_loss_funciton import AbstractLossFunction
 from ..utils.io import chain_segments_from_atom_array
 
 class PRELossFunction(AbstractLossFunction):
+    restraint_type = "PRE"
     def __init__(
             self, 
             restraint_file,
@@ -27,7 +28,9 @@ class PRELossFunction(AbstractLossFunction):
             raise ValueError("PRE ensemble_mode must be 'r6' or 'mean'.")
         
         self.data = pd.read_csv(restraint_file, dtype={"chain1": str, "chain2": str},)
-        self.data = self.data[self.data["type"].astype(str).str.upper() == "PRE"].reset_index(drop=True)
+        self.data = self.data[
+            self.data["type"].astype(str).str.strip().str.upper() == self.restraint_type
+            ].reset_index(drop=True)
         
         self.has_restraints = not self.data.empty
         self.endpoints = []
@@ -309,10 +312,60 @@ class PRELossFunction(AbstractLossFunction):
         return (pd.DataFrame(records), pd.DataFrame(group_records), pd.DataFrame(summaries),)
     
 
+class BondRestraintLoss(PRELossFunction):
+    """Explicit atom-pair bound evaluated for each conformation in the ensemble"""
+    
+    restraint_type = "BOND"
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        if not self.has_restraints:
+            return
+        
+        if any(len(rows) != 1 for _, rows in self.groups):
+            raise ValueError("Each BOND restraint must have a unique constrain_id "
+                             "within its chain pair; OR alternatives are not supported.")
+            
+        if any(endpoint[0] != "direct" for pair in self.endpoints for endpoint in pair):
+            raise ValueError("BOND restraints currently require atoms present "
+                             "in the model topology.")
+    
+    def __call__(self, x_0_hat, time, structures=None, i=None, step=None):
+        if not self.has_restraints:
+            self.last_value = x_0_hat.sum() * 0.0
+            return self.last_value, None
+        
+        distances = self._distances(x_0_hat)
+        lower = distances.new_tensor(self.bounds[0])
+        upper = distances.new_tensor(self.bounds[1])
+        
+        violations = torch.relu(lower - distances) + torch.relu(distances - upper)
+        
+        # Penalize each conformation before averaging the penalties
+        self.last_value = violations.square().mean() * self.scale
+        return self.last_value, None
+    
+    @torch.no_grad()
+    def distance_restraint_report(self, coordinates, tolerance_A=0.0):
+        reports = super().distance_restraint_report(coordinates, tolerance_A=tolerance_A)
+        
+        # explicit covalent bonds are check for each conformation
+        return tuple(
+            frame.loc[
+                frame["evaluation"].str.startswith("member_")
+                ].rename(columns={"pre_row": "bond_row", 
+                                  "selected_pre_row": "selected_bond_row"
+                                  }).reset_index(drop=True) 
+                                  for frame in reports
+                                  )
+            
+
 class NMRWithPRELoss(AbstractLossFunction):
-    def __init__(self, protein_loss, pre_loss):
+    def __init__(self, protein_loss, pre_loss, bond_loss=None):
         self.protein_loss = protein_loss
         self.pre_loss = pre_loss
+        self.bond_loss = bond_loss
         self.last_value = None
         
     def __call__(self, x_0_hat, time, structures=None, i=None, step=None):
@@ -322,12 +375,21 @@ class NMRWithPRELoss(AbstractLossFunction):
         pre_value, _ = self.pre_loss(x_0_hat, time, **kwargs)
         
         self.last_value = protein_value + pre_value
+        
+        if self.bond_loss is not None and self.bond_loss.has_restraints:
+            bond_value, _ = self.bond_loss(x_0_hat, time, **kwargs)
+            self.last_value = self.last_value + bond_value
+            
         return self.last_value, corrected
     
     def wandb_log(self, coordinates):
         result = dict(self.protein_loss.wandb_log(coordinates))
         
         result["pre_loss"] = None if self.pre_loss.last_value is None else float(self.pre_loss.last_value.detach().item())
+        
+        if self.bond_loss is not None:
+            result["attachment_loss"] = None if self.bond_loss.last_value is None else float(self.bond_loss.last_value.detach().item())
+        
         result["loss"] = None if self.last_value is None else float(self.last_value.detach().item())
         return result
     
@@ -348,6 +410,9 @@ class NMRWithPRELoss(AbstractLossFunction):
             
         if self.pre_loss.has_restraints:
             reports["pre"] = self.pre_loss.distance_restraint_report(coordinates, tolerance_A=tolerance_A)
+        
+        if self.bond_loss is not None and self.bond_loss.has_restraints:
+            reports["bond"] = self.bond_loss.distance_restraint_report(coordinates, tolerance_A=tolerance_A)
             
         return reports
             

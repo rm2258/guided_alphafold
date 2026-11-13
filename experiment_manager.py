@@ -23,7 +23,7 @@ from src.utils.run_receipts import (
 )
 from src.losses import * 
 from src.losses.abstract_loss_funciton import AbstractLossFunction
-from src.losses.pre_loss_function import PRELossFunction, NMRWithPRELoss
+from src.losses.pre_loss_function import PRELossFunction, BondRestraintLoss, NMRWithPRELoss
 
 class AtomSubsetLoss(AbstractLossFunction):
     """
@@ -243,7 +243,13 @@ class ExperimentManager:
                                            scale=getattr(noe_config, "pre_scale", 1.0), 
                                            ensemble_mode=getattr(noe_config, "pre_ensemble_mode", "mean"),)
                 
-                loss_function = NMRWithPRELoss(protein_loss, pre_loss)
+                bond_loss = BondRestraintLoss(restraint_file=noe_config.reference_nmr, 
+                                              atom_array=self.model_manager.atom_array, 
+                                              protein_indices=protein_indices, 
+                                              protein_nmr=loss_function, 
+                                              scale=getattr(noe_config, "bond_restraint_scale", 1.0))
+                
+                loss_function = NMRWithPRELoss(protein_loss, pre_loss, bond_loss=bond_loss)
                 
                 loss_functions.append(loss_function)
                 self.nmr_loss_function = loss_function
